@@ -1,113 +1,221 @@
-# Real-Time Voice Assistant
+# Realism Voice Assistant
 
-A conversational voice assistant with natural speech interaction capabilities, powered by Deepgram's speech technologies and Alibaba Cloud's Qwen language model.
+A real-time voice assistant that combines state-of-the-art speech-to-text, language understanding, and text-to-speech technologies for natural conversations.
 
 ## Features
 
-- **Real-time Speech Recognition**: Uses Deepgram's Nova-2/Nova-3 models for accurate and fast speech-to-text.
-- **Natural Language Understanding**: Processes queries with Alibaba Cloud's Qwen language model.
-- **Text-to-Speech**: Converts responses to natural-sounding speech using Deepgram's Aura voice.
-- **Interruption Handling**: Allows users to interrupt the assistant while it's speaking.
-- **Self-speech Filtering**: Prevents the assistant from hearing and responding to its own voice output.
+- **Speech Recognition**: Uses Deepgram's Nova-2/3 model for high-quality, low-latency speech recognition
+- **Natural Language Understanding**: Powered by Alibaba Cloud's Qwen model for intelligent responses
+- **Ultra-Realistic Voice Synthesis**: Integrates Rime's Arcana TTS for lifelike voice output
+- **Responsive Interaction**: Handles interruptions and provides real-time feedback during conversations
+- **Smart Echo Cancellation**: Automatically prevents the assistant from responding to its own speech
 
-## How It Works
+## Components
 
-The system combines several components to create a natural conversation flow:
+- **Speech-to-Text (STT)**: Deepgram for fast, accurate speech recognition
+- **Language Model (LLM)**: Alibaba Cloud Qwen via DashScope API
+- **Text-to-Speech (TTS)**: Rime Arcana for ultra-realistic voice synthesis
 
-1. **Speech Input**: Captures audio from your microphone in real-time.
-2. **Speech Recognition**: Transcribes speech to text using Deepgram's streaming API.
-3. **Language Processing**: Sends transcribed text to Alibaba Cloud's Qwen LLM for understanding and response generation.
-4. **Speech Synthesis**: Converts the LLM's text response to speech using Deepgram's TTS API.
-5. **Conversation Management**: Handles the flow between these components, including interruptions and speech filtering.
+## Setup
 
-## Requirements
+### Prerequisites
 
 - Python 3.10+
-- FFmpeg installed for audio playback
-- Deepgram API Key
-- Alibaba Cloud DashScope API Key
+- FFmpeg (for audio playback)
+- API keys for Deepgram, DashScope, and Rime
 
-## Installation
+### Installation
 
-1. Clone this repository:
-   ```
-   git clone <repository-url>
-   cd Realism_voice_
-   ```
+1. Clone the repository:
+```
+git clone <repository-url>
+cd realism_voice
+```
 
-2. Create a virtual environment and install dependencies:
-   ```
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows, use: .venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
+2. Set up a virtual environment:
+```
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+```
 
-3. Create a `.env` file in the root directory with your API keys:
-   ```
-   DEEPGRAM_API_KEY=your_deepgram_api_key
-   DASHSCOPE_API_KEY=your_alibaba_dashscope_api_key
-   DASHSCOPE_MODEL_NAME=qwen-plus  # Or another available model
-   ```
+3. Install dependencies:
+```
+pip install -r requirements.txt
+```
 
-4. (Optional) Create a `system_prompt.txt` file to customize the LLM's behavior.
+4. Create a `.env` file with your API keys:
+```
+# API Keys
+DASHSCOPE_API_KEY=your_dashscope_api_key_here
+DEEPGRAM_API_KEY=your_deepgram_api_key_here
+RIME_API_KEY=your_rime_api_key_here
+
+# Optional configurations
+DASHSCOPE_MODEL_NAME=qwen-plus
+RIME_SPEAKER=orion
+RIME_API_BASE=https://users.rime.ai/v1/rime-tts
+```
 
 ## Usage
 
-Run the voice assistant with:
+Run the assistant:
 
 ```
 python QuickAgent.py
 ```
 
-To start with a welcome message:
+Optional arguments:
+- `--first_message "Your custom greeting"` - Set a custom greeting
+- `--text_only` - Run without TTS output
 
-```
-python QuickAgent.py --first_message "Hello! I'm your voice assistant. How can I help you today?"
-```
+## Voice Options
 
-For text-only mode (no speech output):
+The assistant uses Rime's Arcana TTS, which offers a variety of realistic voices:
 
-```
-python QuickAgent.py --text_only
-```
+- **orion** (default): A natural male voice
+- Other voices available through Rime's voice catalog
 
-### Conversation Flow
+To change the voice, set the `RIME_SPEAKER` environment variable in your `.env` file.
 
-1. Wait for the "Listening..." prompt.
-2. Speak naturally - you'll see interim transcripts as you speak.
-3. When you pause, the system will process your speech and respond.
-4. You can interrupt the assistant at any time by speaking again.
-5. Say "goodbye", "that's enough", or "stop listening" to exit.
+## Architecture
 
-## Technical Details
+- `QuickAgent.py`: Main application
+- `realism_voice/io/`: Input/output modules (TTS, STT)
+- `realism_voice/utils/`: Utility functions
 
 ### Key Components
 
-- **DeepgramSTT**: Handles speech-to-text processing with real-time transcription.
-- **LanguageModelProcessor**: Manages the connection to the Alibaba Cloud Qwen LLM.
-- **DeepgramTTS**: Converts text responses to speech.
-- **ConversationManager**: Orchestrates the conversation flow between components.
+1. **Conversation Manager**: Orchestrates the conversation flow
+2. **DeepgramSTT**: Handles speech recognition
+3. **RimeTTS**: Generates ultra-realistic speech output
+4. **LanguageModelProcessor**: Processes natural language understanding
 
-### Advanced Features
+### Detailed System Architecture
 
-- **Voice Activity Detection**: Uses Deepgram's VAD to detect when the user has finished speaking.
-- **Endpointing**: Automatically segments speech for better processing.
-- **Interim Results**: Shows what the system is hearing in real-time for feedback.
-- **Error Handling**: Robust error handling for network issues and other failures.
-- **Self-speech Filtering**: Temporarily disables STT processing while TTS is active to prevent feedback loops.
+#### Core Components and Data Flow
+
+1. **Main Application (`QuickAgent.py`)**
+   - Initializes all components and starts the conversation loop
+   - Handles command-line arguments and environment variables
+   - Sets up global exception handling
+
+2. **Conversation Manager (`ConversationManager` class)**
+   - Coordinates data flow between STT, LLM, and TTS
+   - Manages conversation state and user interruptions
+   - Uses asyncio to handle concurrent operations
+   - Main methods:
+     - `main_loop()`: Primary event loop
+     - `process_llm_and_speak()`: Processes user input and generates responses
+
+3. **Speech Recognition (`DeepgramSTT` class)**
+   - Uses Deepgram's WebSocket API for real-time transcription
+   - Manages microphone input and speech processing
+   - Detects speech start/end events for responsive interaction
+   - Key features:
+     - Interim results for real-time feedback
+     - Utterance end detection for natural conversation flow
+     - Processing toggle during TTS to prevent self-feedback
+
+4. **Language Understanding (`LanguageModelProcessor` class)**
+   - Connects to Alibaba Cloud's DashScope API using OpenAI-compatible interface
+   - Maintains conversation history for context
+   - Handles prompt construction and response parsing
+   - Configurable through system prompt and model settings
+
+5. **Voice Synthesis (`RimeTTS` class in `realism_voice/io/rime_tts_async.py`)**
+   - Connects to Rime's Arcana API for ultra-realistic voice synthesis
+   - Streams audio chunks for low-latency playback
+   - Handles playback interruptions and cleanup
+   - Voice customization through speaker parameter
+
+#### System Communication
+
+```
+┌───────────────┐     Transcribed Text     ┌───────────────┐
+│               │───────────────────────>  │               │
+│  DeepgramSTT  │                          │ LanguageModel │
+│    (Input)    │                          │   Processor   │
+│               │  <───────────────────────│               │
+└───────────────┘      Response Text       └───────────────┘
+        │                                           │
+        │                                           │
+        │                                           │
+        │                                           ▼
+        │                                  ┌───────────────┐
+        │                                  │               │
+        │  Speech Processing Toggle        │    RimeTTS    │
+        └─────────────────────────────────>│   (Output)    │
+                                           │               │
+                                           └───────────────┘
+```
+
+### Key Implementation Details
+
+1. **Asynchronous Architecture**
+   - The system uses asyncio throughout for non-blocking operations
+   - Allows handling multiple streams (STT, LLM, TTS) concurrently
+   - Enables interruption handling during any processing phase
+
+2. **Interruption Handling**
+   - Uses asyncio.Event objects to signal interruptions
+   - Task cancellation pattern to stop in-progress operations
+   - Audio stream cleanup to prevent resource leaks
+
+3. **Echo Cancellation Strategy**
+   - STT processing disabled during TTS output
+   - Small delay (1 second) after TTS completes before re-enabling STT
+   - Processing flags to track system speaking state
+
+4. **Error Handling and Resilience**
+   - Robust exception handling at multiple levels
+   - Auto-reconnection for transient network issues
+   - Graceful degradation on API failures
+
+## Extending the System
+
+### Adding New Voices
+
+1. To use a different Rime voice:
+   - Update the `RIME_SPEAKER` value in your `.env` file
+   - Or modify `DEFAULT_SPK` in `realism_voice/io/rime_tts_async.py`
+   - Alternatively, pass the desired speaker name to the `speak()` method directly
+
+2. To add support for a different TTS provider:
+   - Create a new TTS class implementing the same interface as `RimeTTS`
+   - Ensure it provides `speak()` and `stop_playback()` async methods
+   - Update the TTS initialization in `main_async()` function
+
+### Customizing Language Model Behavior
+
+1. Modifying system prompts:
+   - Create or edit `system_prompt.txt` in the project root
+   - The system will automatically load this file to configure the LLM
+
+2. Changing LLM providers:
+   - Update the `LanguageModelProcessor` class to use a different API
+   - Ensure it maintains the same interface for conversation history
+   - Implement `generate_response()` async method with the new API
+
+### Adding New Features
+
+1. Wake word detection:
+   - Could be implemented in `DeepgramSTT` class to only process after a trigger phrase
+   - Add activation state to prevent processing until wake word detected
+
+2. Multi-turn conversation improvements:
+   - Enhance the `LanguageModelProcessor` with better context management
+   - Add conversation summarization to maintain longer histories
+
+3. Multi-modal capabilities:
+   - Integrate with vision APIs to add image understanding
+   - Extend the `ConversationManager` to handle different input types
 
 ## Troubleshooting
 
-- **Audio Playback Issues**: Ensure FFmpeg is installed and accessible in your PATH.
-- **Microphone Access**: Make sure your system has permission to access the microphone.
-- **API Key Errors**: Verify that your API keys are correctly set in the `.env` file.
-- **Speech Recognition Problems**: Check your microphone settings and ensure you're in a quiet environment.
+- **Audio issues**: Make sure FFmpeg is installed and your microphone is working
+- **API errors**: Check your API keys in the `.env` file
+- **Voice not working**: Verify the `RIME_SPEAKER` value and internet connection
 
 ## License
 
-[Add your license information here]
-
-## Acknowledgements
-
-- [Deepgram](https://deepgram.com/) for speech recognition and synthesis APIs
-- [Alibaba Cloud](https://www.alibabacloud.com/) for the Qwen language model 
+[Your License] 

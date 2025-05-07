@@ -1,28 +1,40 @@
-# Environment variables
-.env
-
-# Python virtual environment
-.venv/
-venv/
-ENV/
-
-# Python cache files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# IDE specific files
-.vscode/
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
 .idea/
+.vscode/
 *.swp
 *.swo
-
-# OS specific files
 .DS_Store
-Thumbs.db
 
-# Python version file
-.python-version
-
-# Logs
+# Project specific
+*.mp3
+system_prompt.txt
 *.log 

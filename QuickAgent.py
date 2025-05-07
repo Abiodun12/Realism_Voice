@@ -645,7 +645,14 @@ class DeepgramTTS:
 async def main_async(first_message=None, text_only=False):
     # Initialize your LLM and TTS with real implementations
     llm = LanguageModelProcessor() 
-    tts = DeepgramTTS(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    
+    # Use Rime TTS instead of Deepgram TTS
+    from realism_voice.io.rime_tts_async import RimeTTS
+    tts = RimeTTS()
+    
+    # If no first message provided, use the greeting
+    if not first_message:
+        first_message = "Hey how you doing my dawg!!"
 
     manager = ConversationManager(llm, tts)
     
