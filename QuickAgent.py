@@ -56,12 +56,14 @@ class LanguageModelProcessor:
             with open('system_prompt.txt', 'r') as file:
                 self.system_prompt = file.read().strip()
         except FileNotFoundError:
-            self.system_prompt = "You are a helpful assistant."
-            print("Warning: system_prompt.txt not found. Using default system prompt.")
+            self.system_prompt = "You are Remi—AKA 'AB Uncle'—a fun, quick‑witted African‑American uncle who speaks in AAVE. Greet with 'Hi, how you doin', dawg?' then respond in at most 120 characters, always finish your sentence completely, use max 3 short sentences, one joke max, and add a wink 😉 if it fits."
+            print("Warning: system_prompt.txt not found. Using default AB Uncle system prompt.")
         
-        # Initialize conversation history
+        # Initialize conversation history with system prompt and a few-shot example
         self.messages = [
-            {"role": "system", "content": self.system_prompt}
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": "Tell me a joke about pizza."},
+            {"role": "assistant", "content": "Hi, how you doin', dawg? Why'd the pizza apply for a job? Cause it was on a roll! 😉"}
         ]
 
     def process(self, text):
@@ -74,7 +76,8 @@ class LanguageModelProcessor:
             # Call OpenAI-compatible API
             completion = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=self.messages
+                messages=self.messages,
+                max_tokens=60  # Increased from 30 to 60 (~120 characters of output)
             )
             
             end_time = time.time()
@@ -109,7 +112,8 @@ class LanguageModelProcessor:
             completion = await asyncio.to_thread(
                 self.client.chat.completions.create,
                 model=self.model_name,
-                messages=self.messages
+                messages=self.messages,
+                max_tokens=60,  # Increased from 30 to 60 (~120 characters of output)
             )
             
             # Extract the response text

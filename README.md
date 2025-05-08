@@ -204,11 +204,13 @@ To change the voice, set the `RIME_SPEAKER` environment variable in your `.env` 
 1. Modifying system prompts:
    - Create or edit `system_prompt.txt` in the project root
    - The system will automatically load this file to configure the LLM
+   - To modify the AB Uncle persona, edit this file while maintaining the key instructions (brevity, AAVE style, etc.)
+   - Example alternative: "You are Coach T, a no-nonsense sports trainer who speaks in short, motivational phrases."
 
 2. Changing LLM providers:
-   - Update the `LanguageModelProcessor` class to use a different API
-   - Ensure it maintains the same interface for conversation history
-   - Implement `generate_response()` async method with the new API
+   - Update the `LanguageModelProcessor` class to use a different LLM provider
+   - Ensure it provides the same interface as the current implementation
+   - Update the LLM initialization in `main_async()` function
 
 ### Adding New Features
 
@@ -232,7 +234,31 @@ To change the voice, set the `RIME_SPEAKER` environment variable in your `.env` 
 - **TTS Failures**: If Rime TTS fails, the system will automatically fall back to Deepgram TTS
 - **Self-interruptions**: If the assistant interrupts itself, try increasing the endpointing and utterance_end_ms values
 - **Microphone errors**: Ensure your microphone is properly connected and not being used by another application
+- **Persona issues**: If responses don't match the expected AB Uncle style, check `system_prompt.txt` and ensure it's being loaded correctly
+
+## Voice Persona
+
+The assistant now uses the "AB Uncle" persona - a fun, quick-witted African-American uncle who speaks in AAVE style with concise responses.
+
+### AB Uncle Features:
+- Fun, conversational AAVE speech style
+- Greets with "Hi, how you doin', dawg?"
+- Includes light humor (1-2 jokes max)
+- Keeps responses concise (limited to ~60 tokens/120 characters)
+- Uses 3 short sentences maximum
+- Occasionally adds a wink emoji 😉 when appropriate
+
+You can customize this persona by editing the `system_prompt.txt` file in the project root.
+
+### Token Limits
+
+The system now enforces a 60-token limit (approximately 120 characters) on responses to:
+- Keep interactions brief and engaging
+- Ensure complete sentences without abrupt cutoffs
+- Optimize for voice output without lengthy monologues
+
+This token limit can be adjusted in the `QuickAgent.py` file by modifying the `max_tokens` parameter in the LLM calls.
 
 ## License
 
-[Your License] 
+[Your License]
