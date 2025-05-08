@@ -9,6 +9,8 @@ A real-time voice assistant that combines state-of-the-art speech-to-text, langu
 - **Ultra-Realistic Voice Synthesis**: Integrates Rime's Arcana TTS for lifelike voice output
 - **Responsive Interaction**: Handles interruptions and provides real-time feedback during conversations
 - **Smart Echo Cancellation**: Automatically prevents the assistant from responding to its own speech
+- **Enhanced Speech Completion**: Improved handling of TTS speech to prevent self-interruptions
+- **Resilient Error Handling**: Graceful fallback mechanisms for all components
 
 ## Components
 
@@ -160,16 +162,28 @@ To change the voice, set the `RIME_SPEAKER` environment variable in your `.env` 
    - Uses asyncio.Event objects to signal interruptions
    - Task cancellation pattern to stop in-progress operations
    - Audio stream cleanup to prevent resource leaks
+   - Speaking lock mechanism to prevent overlapping speech
+   - Improved control flow to allow LLM to finish speaking sentences
 
 3. **Echo Cancellation Strategy**
    - STT processing disabled during TTS output
-   - Small delay (1 second) after TTS completes before re-enabling STT
+   - Extended delay (1.5 seconds) after TTS completes before re-enabling STT
    - Processing flags to track system speaking state
+   - Enhanced utterance detection to reduce false positives
 
 4. **Error Handling and Resilience**
    - Robust exception handling at multiple levels
    - Auto-reconnection for transient network issues
    - Graceful degradation on API failures
+   - TTS service fallback mechanism (switches from Rime to Deepgram if needed)
+   - More comprehensive BrokenPipe error handling
+   - Proper cleanup of resources in all error scenarios
+
+5. **Speech Detection Tuning**
+   - Optimized Deepgram parameters for more natural conversation
+   - Extended utterance thresholds (1500ms) to prevent premature speech endings
+   - Increased endpointing delay (500ms) for improved sentence detection
+   - Better handling of interim results to reduce processing of incomplete phrases
 
 ## Extending the System
 
@@ -215,6 +229,9 @@ To change the voice, set the `RIME_SPEAKER` environment variable in your `.env` 
 - **Audio issues**: Make sure FFmpeg is installed and your microphone is working
 - **API errors**: Check your API keys in the `.env` file
 - **Voice not working**: Verify the `RIME_SPEAKER` value and internet connection
+- **TTS Failures**: If Rime TTS fails, the system will automatically fall back to Deepgram TTS
+- **Self-interruptions**: If the assistant interrupts itself, try increasing the endpointing and utterance_end_ms values
+- **Microphone errors**: Ensure your microphone is properly connected and not being used by another application
 
 ## License
 
