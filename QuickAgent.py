@@ -940,9 +940,22 @@ async def tts_endpoint(request: Request):
     body = await request.body()
     text = body.decode()
     
-    # Use Deepgram TTS
+    # Try to use Rime TTS first, fall back to Deepgram if needed
+    try:
+        from realism_voice.io.rime_tts_async import RimeTTS
+        if os.getenv("RIME_API_KEY"):
+            print(f"Using Rime TTS for: {text}")
+            tts = RimeTTS()
+            
+            # Use the new get_audio_data method which returns a generator of audio chunks
+            return StreamingResponse(tts.get_audio_data(text), media_type="audio/mp3")
+    except Exception as e:
+        print(f"Error using Rime TTS: {e}")
+        print("Falling back to Deepgram TTS")
+    
+    # Fallback to Deepgram TTS
     if not os.getenv("DEEPGRAM_API_KEY"):
-        return JSONResponse({"error": "DEEPGRAM_API_KEY not set"}, status_code=500)
+        return JSONResponse({"error": "No TTS providers available. Set DEEPGRAM_API_KEY or RIME_API_KEY."}, status_code=500)
     
     tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
     audio_data = await tts.get_audio_data(text)
@@ -961,9 +974,29 @@ async def websocket_endpoint(websocket: WebSocket):
     # Initialize STT with the queue
     stt = DeepgramSTT(transcription_queue)
     
-    # Initialize LLM and TTS
+    # Initialize LLM
     llm = LanguageModelProcessor()
-    tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
+    
+    # Try to use Rime TTS first, fall back to Deepgram if needed
+    try:
+        from realism_voice.io.rime_tts_async import RimeTTS
+        if os.getenv("RIME_API_KEY"):
+            print("Using Rime TTS for WebSocket")
+            tts = RimeTTS()
+        else:
+            # Fall back to Deepgram TTS
+            print("RIME_API_KEY not set, falling back to Deepgram TTS")
+            if not os.getenv("DEEPGRAM_API_KEY"):
+                await websocket.close(1008, "No TTS providers available")
+                return
+            tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
+    except Exception as e:
+        print(f"Error initializing Rime TTS: {e}")
+        print("Falling back to Deepgram TTS")
+        if not os.getenv("DEEPGRAM_API_KEY"):
+            await websocket.close(1008, "No TTS providers available")
+            return
+        tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
     
     # Create conversation manager
     manager = ConversationManager(llm, tts)

@@ -12,9 +12,84 @@ class RimeTTS:
     def __init__(self, api_key=None):
         self.api_key = api_key or RIME_API_KEY
         self.player_process = None
+        self.audio_data = None  # Store audio data for API streaming
         self.play_command = ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", "-"]
         # For macOS: self.play_command = ["afplay", "-"] 
         # For Linux: self.play_command = ["aplay", "-f", "S16_LE", "-r", "24000", "-"]
+
+    async def get_audio_data(self, text, speaker=DEFAULT_SPK):
+        """
+        Gets MP3 bytes from Rime Arcana without playing them.
+        
+        Args:
+            text: The text to be spoken
+            speaker: The speaker voice to use
+            
+        Returns:
+            A generator that yields audio chunks
+        """
+        if not text:
+            print("TTS: No text to get audio for.")
+            return
+            
+        if not self.api_key:
+            print("Error: RIME_API_KEY not set")
+            return
+
+        headers = {
+            "Accept": "audio/mp3",  # trigger streaming MP3
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        payload = {
+            "speaker": speaker,
+            "text": text,
+            "modelId": "arcana",  # Arcana for lifelike voice
+            "audioFormat": "mp3",  # ensure MP3 payload
+            "reduceLatency": True,  # shave off extra processing
+            "samplingRate": 22050,  # or lower for telephony
+            "repetition_penalty": 1.2,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 1200,
+        }
+
+        print(f"Getting audio data for: {text}")
+        
+        try:
+            # Using asyncio.to_thread for the blocking requests call
+            response = await asyncio.to_thread(
+                requests.post, 
+                RIME_TTS_URL, 
+                headers=headers, 
+                json=payload, 
+                stream=True
+            )
+            
+            response.raise_for_status()
+            
+            # Collect all audio data
+            chunks = []
+            for chunk in response.iter_content(chunk_size=4096):
+                if chunk:
+                    chunks.append(chunk)
+                    # Also yield for streaming
+                    yield chunk
+                    
+            # Store complete audio data for later use
+            if chunks:
+                self.audio_data = b''.join(chunks)
+            else:
+                print(f"TTS: No audio data received from Rime for: {text}")
+                self.audio_data = None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"TTS Request failed: {e}")
+            yield b''  # Empty bytes to keep the generator valid
+        except Exception as e:
+            print(f"TTS Error: {e}")
+            yield b''  # Empty bytes to keep the generator valid
 
     async def speak(self, text, interrupt_event=None, speaker=DEFAULT_SPK):
         """
@@ -76,6 +151,7 @@ class RimeTTS:
             
             audio_received_time = None
             chunk_count = 0
+            audio_chunks = []  # Collect chunks for API use
             
             for chunk in response.iter_content(chunk_size=4096):
                 if interrupt_event and interrupt_event.is_set():
@@ -85,6 +161,9 @@ class RimeTTS:
                     return
 
                 if chunk:
+                    # Save the chunk for API use
+                    audio_chunks.append(chunk)
+                    
                     if audio_received_time is None:  # First chunk of audio
                         audio_received_time = asyncio.get_event_loop().time()
                         actual_ttfb = int((audio_received_time - start_time) * 1000)
@@ -116,6 +195,12 @@ class RimeTTS:
                 
                 chunk_count += 1
             
+            # Store the complete audio data for API use
+            if audio_chunks:
+                self.audio_data = b''.join(audio_chunks)
+            else:
+                self.audio_data = None
+                
             if chunk_count == 0 and audio_received_time is None:  # No audio data received
                 print(f"TTS: No audio data received from Rime for: {text}")
 
@@ -137,8 +222,10 @@ class RimeTTS:
 
         except requests.exceptions.RequestException as e:
             print(f"TTS Request failed: {e}")
+            self.audio_data = None
         except Exception as e:
             print(f"TTS Error: {e}")
+            self.audio_data = None
             await self.stop_playback()
         finally:
             if self.player_process and self.player_process.returncode is None:
