@@ -329,8 +329,18 @@ class DeepgramSTT:
         self.processing_enabled = True  # Flag to enable/disable transcript processing
         # Store the event loop that this object was created on
         self.loop = asyncio.get_event_loop()
+        
+        # Check if we're running in a server environment (like Render.com)
+        self.is_server_env = os.getenv("PORT") is not None
+        if self.is_server_env:
+            print("Running in server environment - microphone access will be disabled")
 
     async def start_listening(self):
+        # Skip microphone initialization in server environments
+        if self.is_server_env:
+            print("Microphone initialization skipped (server environment)")
+            return
+            
         # Ensure we're on the same event loop
         if asyncio.get_event_loop() != self.loop:
             print("Warning: Event loop mismatch. This might cause issues.")
@@ -1018,7 +1028,7 @@ if __name__ == "__main__":
     # Check if running directly or through uvicorn
     if os.getenv("PORT"):
         # Running on Render.com, use the PORT environment variable
-        port = int(os.getenv("PORT", 8000))
+        port = int(os.getenv("PORT", 10000))
         host = "0.0.0.0"
         print(f"Starting API server on {host}:{port}")
         # Run in API server mode only (no microphone)
@@ -1029,8 +1039,12 @@ if __name__ == "__main__":
             # Try to run the interactive agent
             asyncio.run(main_async())
         except ModuleNotFoundError as e:
-            # If PyAudio or other modules are missing, fall back to API-only mode
-            print(f"Warning: {e}")
+            if "pyaudio" in str(e).lower():
+                print(f"Warning: {e}")
+                print("PyAudio is required for microphone access.")
+                print("Install with: pip install pyaudio")
+                print("On Linux: sudo apt-get install python3-pyaudio portaudio19-dev")
+                print("On macOS: brew install portaudio && pip install pyaudio")
             print("Falling back to API-only mode (no microphone)")
             port = 8000
             host = "127.0.0.1"

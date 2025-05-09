@@ -3,7 +3,10 @@ services:
     name: realism-voice
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      apt-get update -y
+      apt-get install -y portaudio19-dev python3-pyaudio ffmpeg
+      pip install -r requirements.txt
     startCommand: python QuickAgent.py
     envVars:
       - key: DEEPGRAM_API_KEY
