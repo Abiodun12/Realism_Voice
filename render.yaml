@@ -19,4 +19,12 @@ services:
       - key: RIME_API_BASE
         value: https://users.rime.ai/v1/rime-tts
       - key: PORT
-        value: 8000 
+        value: 10000
+    buildFilter:
+      paths:
+        - requirements.txt
+    autoDeploy: false
+    # Add system packages required for PyAudio
+    preInstallCommands:
+      - apt-get update -y
+      - apt-get install -y portaudio19-dev python3-pyaudio 

@@ -907,6 +907,14 @@ async def shutdown(manager):
     await asyncio.sleep(1)
 
 # API Endpoints
+@app.get("/")
+async def root():
+    return {"message": "Realism Voice API is running", "endpoints": [
+        "/chat - POST: Send text to chat with the AI",
+        "/tts - POST: Convert text to speech",
+        "/voice/ws - WebSocket: Real-time voice conversation"
+    ]}
+
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     body = await request.body()
@@ -1012,10 +1020,18 @@ if __name__ == "__main__":
         # Running on Render.com, use the PORT environment variable
         port = int(os.getenv("PORT", 8000))
         host = "0.0.0.0"
+        print(f"Starting API server on {host}:{port}")
+        # Run in API server mode only (no microphone)
+        uvicorn.run(app, host=host, port=port)
     else:
-        # Local development
-        port = 8000
-        host = "127.0.0.1"
-    
-    # Run with uvicorn
-    uvicorn.run(app, host=host, port=port) 
+        # Local development - can use interactive mode with microphone
+        try:
+            # Try to run the interactive agent
+            asyncio.run(main_async())
+        except ModuleNotFoundError as e:
+            # If PyAudio or other modules are missing, fall back to API-only mode
+            print(f"Warning: {e}")
+            print("Falling back to API-only mode (no microphone)")
+            port = 8000
+            host = "127.0.0.1"
+            uvicorn.run(app, host=host, port=port) 
