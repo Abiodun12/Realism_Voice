@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Realism Voice WebSocket Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .controls { margin: 20px 0; }
+        button { padding: 10px; margin-right: 10px; }
+        .messages { border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: auto; }
+        .user { color: blue; }
+        .assistant { color: green; }
+        .system { color: gray; font-style: italic; }
+        .error { color: red; }
+        .debug { color: purple; font-size: 0.8em; }
+    </style>
+</head>
+<body>
+    <h1>AB Uncle Voice Chat</h1>
+    
+    <div class="controls">
+        <button id="connectBtn">Connect</button>
+        <button id="startBtn" disabled>Start Recording</button>
+        <button id="stopBtn" disabled>Stop Recording</button>
+        <button id="sendTextBtn">Send Text</button>
+    </div>
+    
+    <div>
+        <input type="text" id="textInput" placeholder="Type a message..." style="width: 300px;">
+    </div>
+    
+    <div>
+        <label>
+            <input type="checkbox" id="debugMode"> Show Debug Info
+        </label>
+        <label>
+            <input type="checkbox" id="useLocalServer"> Use Local Server
+        </label>
+    </div>
+    
+    <h3>Conversation:</h3>
+    <div class="messages" id="messages"></div>
+    
+    <script>
+        let socket;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 3;
+        
+        const messagesDiv = document.getElementById('messages');
+        const connectBtn = document.getElementById('connectBtn');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const sendTextBtn = document.getElementById('sendTextBtn');
+        const textInput = document.getElementById('textInput');
+        const debugMode = document.getElementById('debugMode');
+        const useLocalServer = document.getElementById('useLocalServer');
+        
+        // Audio context for proper audio formatting
+        let audioContext;
+        
+        // Add message to the UI
+        function addMessage(text, type) {
+            if (type === 'debug' && !debugMode.checked) {
+                return; // Skip debug messages if debug mode is off
+            }
+            const message = document.createElement('div');
+            message.className = type;
+            message.textContent = type === 'user' ? `You: ${text}` : 
+                                  type === 'assistant' ? `AB Uncle: ${text}` : text;
+            messagesDiv.appendChild(message);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        // Get server URL based on checkbox
+        function getServerUrl() {
+            return useLocalServer.checked 
+                ? 'ws://localhost:8000/voice/ws'
+                : 'wss://realism-voice.onrender.com/voice/ws';
+        }
+        
+        // Get API URL based on checkbox
+        function getApiUrl(endpoint) {
+            const baseUrl = useLocalServer.checked 
+                ? 'http://localhost:8000'
+                : 'https://realism-voice.onrender.com';
+            return `${baseUrl}/${endpoint}`;
+        }
+        
+        // Connect to WebSocket
+        connectBtn.addEventListener('click', () => {
+            connectToServer();
+        });
+        
+        function connectToServer() {
+            addMessage('Connecting to server...', 'system');
+            
+            // Close existing socket if any
+            if (socket) {
+                socket.close();
+            }
+            
+            const serverUrl = getServerUrl();
+            addMessage(`Connecting to ${serverUrl}`, 'debug');
+            
+            socket = new WebSocket(serverUrl);
+            
+            socket.onopen = () => {
+                addMessage('Connected!', 'system');
+                connectBtn.disabled = true;
+                startBtn.disabled = false;
+                sendTextBtn.disabled = false;
+                reconnectAttempts = 0; // Reset reconnect counter on successful connection
+            };
+            
+            socket.onmessage = (event) => {
+                try {
+                    // Check if the message is JSON or binary
+                    if (typeof event.data === 'string') {
+                        const data = JSON.parse(event.data);
+                        
+                        addMessage(`Received message type: ${data.type}`, 'debug');
+                        
+                        if (data.type === 'transcript') {
+                            if (data.is_final) {
+                                addMessage(data.text, 'user');
+                            } else {
+                                addMessage(`Interim: ${data.text}`, 'debug');
+                            }
+                        }
+                        else if (data.type === 'response') {
+                            addMessage(data.text, 'assistant');
+                        }
+                    } else {
+                        // Binary data (audio)
+                        addMessage(`Received binary data: ${event.data.size} bytes`, 'debug');
+                        
+                        // Play audio
+                        const audio = new Audio();
+                        audio.src = URL.createObjectURL(new Blob([event.data], { type: 'audio/mp3' }));
+                        audio.play();
+                    }
+                } catch (error) {
+                    addMessage(`Error processing message: ${error.message}`, 'error');
+                    console.error('Message processing error:', error);
+                }
+            };
+            
+            socket.onclose = (event) => {
+                addMessage(`Disconnected from server (code: ${event.code}, reason: ${event.reason || 'none'})`, 'system');
+                connectBtn.disabled = false;
+                startBtn.disabled = true;
+                stopBtn.disabled = true;
+                sendTextBtn.disabled = true;
+                
+                // Try to reconnect if unexpectedly closed and not max attempts
+                if (!event.wasClean && reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    const delay = reconnectAttempts * 2000; // Increasing backoff
+                    addMessage(`Attempting to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`, 'system');
+                    setTimeout(connectToServer, delay);
+                }
+            };
+            
+            socket.onerror = (error) => {
+                addMessage(`WebSocket error: ${error.message || 'Connection failed'}`, 'error');
+                console.error('WebSocket error:', error);
+            };
+        }
+        
+        // Start recording
+        startBtn.addEventListener('click', async () => {
+            try {
+                // Initialize audio context if needed
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    addMessage(`Audio context sample rate: ${audioContext.sampleRate}Hz`, 'debug');
+                }
+                
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+                
+                addMessage(`Got audio stream with ${stream.getAudioTracks().length} tracks`, 'debug');
+                
+                // Create media recorder with proper MIME type
+                const options = { mimeType: 'audio/webm;codecs=opus' };
+                mediaRecorder = new MediaRecorder(stream, options);
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = async (event) => {
+                    if (event.data.size > 0) {
+                        addMessage(`Got audio chunk: ${event.data.size} bytes`, 'debug');
+                        audioChunks.push(event.data);
+                        
+                        try {
+                            // Convert to raw audio and send to server
+                            const arrayBuffer = await event.data.arrayBuffer();
+                            if (socket && socket.readyState === WebSocket.OPEN) {
+                                socket.send(arrayBuffer);
+                                addMessage(`Sent ${arrayBuffer.byteLength} bytes to server`, 'debug');
+                            } else {
+                                addMessage('Cannot send audio: WebSocket not connected', 'error');
+                            }
+                        } catch (error) {
+                            addMessage(`Error sending audio: ${error.message}`, 'error');
+                            console.error('Audio sending error:', error);
+                        }
+                    }
+                };
+                
+                mediaRecorder.onstop = () => {
+                    addMessage('Recording stopped', 'system');
+                    stream.getTracks().forEach(track => track.stop());
+                };
+                
+                // Start recording with smaller chunks for more responsive interaction
+                mediaRecorder.start(300); // Collect data in 300ms chunks
+                isRecording = true;
+                addMessage('Recording started...', 'system');
+                
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+            } catch (error) {
+                addMessage(`Error accessing microphone: ${error.message}`, 'error');
+                console.error('Microphone access error:', error);
+            }
+        });
+        
+        // Stop recording
+        stopBtn.addEventListener('click', () => {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+        });
+        
+        // Send text (for testing without microphone)
+        sendTextBtn.addEventListener('click', async () => {
+            const text = textInput.value.trim();
+            if (text) {
+                // Use the /chat endpoint instead of WebSocket for text
+                try {
+                    addMessage('Sending text...', 'system');
+                    const response = await fetch(getApiUrl('chat'), {
+                        method: 'POST',
+                        body: text
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    const data = await response.json();
+                    addMessage(text, 'user');
+                    addMessage(data.response, 'assistant');
+                    
+                    // Get TTS audio for the response
+                    const ttsResponse = await fetch(getApiUrl('tts'), {
+                        method: 'POST',
+                        body: data.response
+                    });
+                    
+                    if (!ttsResponse.ok) {
+                        throw new Error(`TTS server responded with ${ttsResponse.status}: ${ttsResponse.statusText}`);
+                    }
+                    
+                    // Play audio
+                    const audioBlob = await ttsResponse.blob();
+                    const audio = new Audio();
+                    audio.src = URL.createObjectURL(audioBlob);
+                    audio.play();
+                    
+                    textInput.value = '';
+                } catch (error) {
+                    addMessage(`Error: ${error.message}`, 'error');
+                    console.error('Text sending error:', error);
+                }
+            }
+        });
+        
+        // Allow Enter key to send text
+        textInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendTextBtn.click();
+            }
+        });
+    </script>
+</body>
+</html> 

@@ -320,8 +320,13 @@ async def get_transcript(callback, interim_callback=None):
 class DeepgramSTT:
     def __init__(self, manager_queue):
         self.manager_queue = manager_queue
+        self.deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
+        if not self.deepgram_api_key:
+            print("ERROR: DEEPGRAM_API_KEY environment variable is not set")
+            raise ValueError("Missing Deepgram API key")
+            
         config = DeepgramClientOptions(options={"keepalive": "true"})
-        self.client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"), config)
+        self.client = DeepgramClient(self.deepgram_api_key, config)
         self.dg_connection = None
         self.microphone = None
         self.is_speaking = False
@@ -336,36 +341,46 @@ class DeepgramSTT:
             print("Running in server environment - microphone access will be disabled")
 
     async def start_listening(self):
-        # Skip microphone initialization in server environments
-        if self.is_server_env:
-            print("Microphone initialization skipped (server environment)")
-            return
-            
         # Ensure we're on the same event loop
         if asyncio.get_event_loop() != self.loop:
             print("Warning: Event loop mismatch. This might cause issues.")
         
-        # The configuration was moved to the client initialization in __init__
-        self.dg_connection = self.client.listen.asynclive.v("1")
+        # Create the Deepgram connection
+        try:
+            self.dg_connection = self.client.listen.asynclive.v("1")
+            print("Created Deepgram connection")
+        except Exception as e:
+            print(f"Failed to create Deepgram connection: {e}")
+            return False
 
-        # Fix: Define async event handlers properly
+        # Define async event handlers properly
         async def on_open_async(connection, **kwargs):
-            print("Deepgram connection opened.")
+            print("Deepgram connection opened successfully.")
             
         async def on_message_async(connection, result, **kwargs):
             # Only process if speech processing is enabled (not speaking)
             if not self.processing_enabled:
                 return
                 
-            sentence = result.channel.alternatives[0].transcript
-            
-            if result.is_final and result.speech_final:
-                self.accumulated_transcript = result.channel.alternatives[0].transcript
-                pass
-            elif not result.is_final and len(sentence) > 0: # Interim result
-                current_transcript_interim = result.channel.alternatives[0].transcript
-                print(f"Hearing: {current_transcript_interim}...", end='\r', flush=True)
-                self.accumulated_transcript = current_transcript_interim
+            try:
+                if not hasattr(result, 'channel') or not hasattr(result.channel, 'alternatives') or len(result.channel.alternatives) == 0:
+                    print("Warning: Received message with no alternatives")
+                    return
+                    
+                sentence = result.channel.alternatives[0].transcript
+                
+                if result.is_final and result.speech_final:
+                    if sentence.strip():
+                        self.accumulated_transcript = sentence.strip()
+                        print(f"Final transcript: {self.accumulated_transcript}")
+                        # Immediately send the final transcript
+                        await self.send_to_manager_async()
+                elif not result.is_final and sentence.strip(): # Interim result
+                    current_transcript_interim = sentence.strip()
+                    print(f"Hearing: {current_transcript_interim}...", end='\r', flush=True)
+                    self.accumulated_transcript = current_transcript_interim
+            except Exception as e:
+                print(f"Error processing transcription message: {e}")
         
         async def on_utterance_end_async(connection, utterance_end, **kwargs):
             # Only process if speech processing is enabled (not speaking)
@@ -409,51 +424,59 @@ class DeepgramSTT:
         self.dg_connection.on(LiveTranscriptionEvents.Error, on_error_async)
         self.dg_connection.on(LiveTranscriptionEvents.Close, on_close_async)
 
-        # More focused options for accurate speech detection
+        # Best options for processing WebSocket audio in a server environment
         options = LiveOptions(
             model="nova-2", # or nova-3 if available and preferred
             language="en-US",
             smart_format=True,
-            encoding="linear16", # Make sure this matches your microphone
+            encoding="linear16", # Match with client's audio format
             channels=1,
-            sample_rate=16000,   # Make sure this matches your microphone
+            sample_rate=16000,   # Match with client's audio format
             interim_results=True,
             utterance_end_ms=1500, # Increased from 1000ms to 1500ms to avoid premature end detection
             vad_events=True,
             endpointing=500,     # Increased from 300ms to 500ms to wait longer for more speech
         )
 
-        print("Listening...")
-        # The start method in AsyncLive version does need an await
+        print("Starting Deepgram connection...")
+        # Start the connection
         try:
             await self.dg_connection.start(options)
+            print("Deepgram connection started successfully")
             
-            # Create and start microphone after successful connection
-            try:
-                # Store the current event loop to ensure consistency
-                self.microphone = Microphone(self.dg_connection.send)
-                self.microphone.start()
-                print("Microphone started successfully.")
-            except Exception as e:
-                print(f"Failed to start microphone: {e}")
-                await self.dg_connection.finish()  # Clean up connection if microphone fails
-                return
-                
+            # Only create microphone in non-server environment
+            if not self.is_server_env:
+                try:
+                    # Store the current event loop to ensure consistency
+                    self.microphone = Microphone(self.dg_connection.send)
+                    self.microphone.start()
+                    print("Microphone started successfully.")
+                except Exception as e:
+                    print(f"Failed to start microphone (non-critical in WebSocket mode): {e}")
+                    # Don't return, as we can still use WebSocket audio
+            
+            return True
         except Exception as e:
             print(f"Failed to start Deepgram connection: {e}")
-            return
+            self.dg_connection = None
+            return False
 
-    # Remove old instance methods as they're now handled by the local async functions
     async def send_to_manager_async(self):
         transcript_to_send = self.accumulated_transcript.strip()
         if transcript_to_send:
             print(f"\nHuman: {transcript_to_send}")
-            await self.manager_queue.put(transcript_to_send)
+            # Format the transcript as a dictionary with additional metadata
+            await self.manager_queue.put({
+                "text": transcript_to_send,
+                "is_final": True,
+                "timestamp": time.time()
+            })
             self.accumulated_transcript = "" # Reset for next utterance
         else:
             print("Send_to_manager called with empty transcript.")
 
     async def stop_listening(self):
+        print("Stopping Deepgram STT...")
         if self.dg_connection:
             try:
                 if self.microphone and hasattr(self.microphone, 'finish'):
@@ -968,6 +991,8 @@ async def tts_endpoint(request: Request):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
+    print("WebSocket connection accepted")
+    
     # Create a queue for communication between STT and this handler
     transcription_queue = asyncio.Queue()
     
@@ -999,40 +1024,100 @@ async def websocket_endpoint(websocket: WebSocket):
         tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
     
     # Create conversation manager
-    manager = ConversationManager(llm, tts)
+    manager = ConversationManager(llm, tts, stt)
     
-    # Start STT listening
-    await stt.start_listening()
+    # Start STT listening - CRITICAL FIX: This must be successful before proceeding
+    try:
+        print("Starting STT listening...")
+        await stt.start_listening()
+        
+        # CRITICAL FIX: Check if dg_connection was properly initialized
+        if not stt.dg_connection and not stt.is_server_env:
+            print("Error: Deepgram connection not initialized properly")
+            await websocket.close(1011, "Failed to initialize STT connection")
+            return
+            
+        # If in server environment, we need to create the connection since start_listening skips it
+        if stt.is_server_env and not stt.dg_connection:
+            print("Server environment detected - initializing Deepgram connection manually")
+            stt.dg_connection = stt.client.listen.asynclive.v("1")
+            options = LiveOptions(
+                model="nova-2",
+                language="en-US",
+                smart_format=True,
+                encoding="linear16",
+                channels=1,
+                sample_rate=16000,
+                interim_results=True,
+                utterance_end_ms=1500,
+                vad_events=True,
+                endpointing=500,
+            )
+            await stt.dg_connection.start(options)
+            print("Deepgram connection initialized for server environment")
+    except Exception as e:
+        print(f"Error starting STT: {e}")
+        await websocket.close(1011, "Failed to start speech recognition")
+        return
     
     try:
         # Start a background task to process transcription queue
         process_task = asyncio.create_task(process_transcriptions(websocket, transcription_queue, manager))
+        print("Started background task for processing transcriptions")
         
         # Receive audio data from client and send to STT
         while True:
-            data = await websocket.receive_bytes()
-            stt.connection.send(data)
+            try:
+                data = await websocket.receive_bytes()
+                print(f"Received {len(data)} bytes of audio data")
+                
+                if not stt.dg_connection:
+                    print("Error: Deepgram connection is None, cannot send data")
+                    break
+                    
+                try:
+                    # Send the audio data to Deepgram
+                    stt.dg_connection.send(data)
+                except Exception as e:
+                    print(f"Error sending data to Deepgram: {e}")
+                    break
+            except Exception as e:
+                print(f"Error receiving data from WebSocket: {e}")
+                break
     
     except WebSocketDisconnect:
-        print("WebSocket disconnected")
+        print("WebSocket disconnected by client")
     except Exception as e:
         print(f"Error in WebSocket: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Clean up
-        process_task.cancel()
+        print("Cleaning up WebSocket resources...")
+        if 'process_task' in locals() and process_task:
+            process_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(process_task), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass  # Expected
+                
         await stt.stop_listening()
         await websocket.close()
+        print("WebSocket cleanup complete")
 
 async def process_transcriptions(websocket, queue, manager):
+    print("Starting transcription processing task")
     while True:
         try:
             # Get transcription from queue
             transcription = await queue.get()
+            print(f"Received transcription: {transcription}")
             
             # Format for sending to client
             if isinstance(transcription, dict):
                 # Send transcription to client
                 await websocket.send_json({"type": "transcript", "text": transcription.get("text", ""), "is_final": transcription.get("is_final", False)})
+                print(f"Sent transcript to client: {transcription.get('text', '')}")
                 
                 # Process with LLM and TTS if it's a final transcription
                 if transcription.get("is_final", False):
@@ -1041,21 +1126,28 @@ async def process_transcriptions(websocket, queue, manager):
                     if response and audio_data:
                         # Send response text to client
                         await websocket.send_json({"type": "response", "text": response})
+                        print(f"Sent response to client: {response}")
                         
                         # Send audio data in chunks
                         chunk_size = 8192
                         for i in range(0, len(audio_data), chunk_size):
                             chunk = audio_data[i:i+chunk_size]
                             await websocket.send_bytes(chunk)
+                        print(f"Sent {len(audio_data)} bytes of audio data in chunks")
             else:
                 # Simple string transcription
                 await websocket.send_json({"type": "transcript", "text": str(transcription), "is_final": True})
+                print(f"Sent string transcript to client: {transcription}")
         except asyncio.CancelledError:
+            print("Transcription processing task cancelled")
             break
         except Exception as e:
             print(f"Error processing transcription: {e}")
+            import traceback
+            traceback.print_exc()
             # Continue processing next transcription
             continue
+    print("Transcription processing task ended")
 
 if __name__ == "__main__":
     # Check if running directly or through uvicorn
