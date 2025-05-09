@@ -10,6 +10,10 @@ import argparse
 from pathlib import Path
 from openai import OpenAI
 import signal
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.memory import ConversationBufferMemory
@@ -27,6 +31,21 @@ from deepgram import (
     LiveTranscriptionEvents,
     LiveOptions,
     Microphone,
+)
+
+# Create FastAPI app
+app = FastAPI(title="Realism Voice API", description="API for voice interactions using Deepgram")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",          # local Next.js dev
+        "https://your-site.vercel.app",   # replace with your real domain
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Make sure to load environment variables with explicit path
@@ -451,71 +470,77 @@ class DeepgramSTT:
         self.microphone = None
 
 class ConversationManager:
-    def __init__(self, llm, tts):
-        self.llm = llm
-        self.tts = tts
-        self.transcription_queue = asyncio.Queue() 
-        self.stt = DeepgramSTT(self.transcription_queue)
-        self.is_running = True
-        self.current_llm_task = None
-        self.user_spoke_again = asyncio.Event()
+    def __init__(self, llm, tts, stt=None):
+        """Initialize conversation manager with LLM and TTS"""
+        self.llm = llm  # Language model processor
+        self.tts = tts  # Text-to-speech processor
+        self.stt = stt  # Speech-to-text processor (optional)
+        self.transcription_queue = None  # Queue for transcriptions from STT
+        self.is_running = True  # Flag to control the main loop
         self.is_speaking = False  # Flag to track if system is speaking
-        self.speaking_lock = asyncio.Lock()  # Lock to prevent overlapping speech
+        self.interrupt_event = asyncio.Event()  # Event to interrupt TTS
+        
+        # Method to cancel any background tasks
+        self.tasks = []
+    
+    def cancel_tasks(self):
+        """Cancel all background tasks"""
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+        self.is_running = False
 
     async def process_llm_and_speak(self, text_input):
-        print(f"LLM processing: '{text_input}'")
-        # Reset the event before starting LLM/TTS
-        self.user_spoke_again.clear()
+        """Process user input with LLM and speak the response"""
+        start_time = time.time()
         
-        try:
-            llm_response_text, llm_time = await self.llm.generate_response(text_input)
-            print(f"LLM ({llm_time}ms): {llm_response_text}")
-
-            if self.user_spoke_again.is_set():
-                print("User spoke again during LLM response generation. Not speaking this response.")
-                return
-
-            if llm_response_text:
-                # Use lock to prevent overlapping speech
-                async with self.speaking_lock:
-                    # Disable speech processing before speaking
-                    self.is_speaking = True
-                    self.stt.processing_enabled = False
-                    print("Speech processing disabled during TTS output...")
-                    
-                    try:
-                        # Speak the response
-                        await self.tts.speak(llm_response_text, self.user_spoke_again)
-                        
-                        # Add a delay after speech before resuming speech processing
-                        # This prevents any audio echo/feedback from being processed
-                        if not self.user_spoke_again.is_set():
-                            try:
-                                # Increased delay to ensure we don't hear echo
-                                await asyncio.sleep(1.5)  # 1.5 second delay to avoid echo detection
-                            except asyncio.CancelledError:
-                                # Task was cancelled during sleep - that's fine
-                                return
-                    except Exception as e:
-                        print(f"Error during TTS: {e}")
-                    finally:
-                        # Even if there's an error, reset these flags
-                        self.is_speaking = False
-                        self.stt.processing_enabled = True
-                        print("Speech processing resumed.")
-            else:
-                print("LLM returned no response.")
+        # Skip LLM processing if input is too short or empty
+        if len(text_input.strip()) <= 1:
+            return None, None
             
-            if not self.user_spoke_again.is_set() and self.is_running:
-                print("Audio playback complete")
-        except asyncio.CancelledError:
-            print("LLM/TTS processing was cancelled")
-            raise
-        except Exception as e:
-            print(f"Error in process_llm_and_speak: {e}")
-            # Still reset flags on error
+        print(f"Processing input: {text_input}")
+        
+        # Process with LLM
+        llm_response, llm_time = await self.llm.generate_response(text_input)
+        
+        if llm_response:
+            # Speak the response
+            self.is_speaking = True
+            
+            # Notify STT to disable processing
+            self.stt.processing_enabled = False
+            
+            # Get the TTS audio data
+            tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
+            audio_stream = await tts.get_audio_data(llm_response)
+            
+            # Collect audio chunks
+            audio_chunks = []
+            async for chunk in audio_stream:
+                audio_chunks.append(chunk)
+            
+            # Concatenate audio chunks
+            audio_data = b''.join(audio_chunks)
+            
+            # Speak the response (for local playback)
+            await self.tts.speak(llm_response, self.interrupt_event)
+            
+            # Calculate and display total time
+            total_time = int((time.time() - start_time) * 1000)
+            print(f"Total processing time: {total_time}ms")
+            
+            # Mark speaking as done
             self.is_speaking = False
+            
+            # Re-enable STT processing
             self.stt.processing_enabled = True
+            
+            # Return response and audio data
+            return llm_response, audio_data
+            
+        else:
+            print("LLM returned no response.")
+            return None, None
 
     async def main_loop(self):
         await self.stt.start_listening()
@@ -529,7 +554,7 @@ class ConversationManager:
                     # or if the user explicitly interrupted
                     if self.is_speaking:
                         print("User spoke while system was speaking.")
-                        self.user_spoke_again.set()  # Signal that new user input has arrived
+                        self.interrupt_event.set()  # Signal that new user input has arrived
                     
                         if self.current_llm_task and not self.current_llm_task.done():
                             print("Cancelling previous task due to user interruption.")
@@ -551,15 +576,15 @@ class ConversationManager:
                             "stop listening" in user_input.lower() or \
                             "goodbye" in user_input.lower():
                                 print("Exit phrase detected. Shutting down.")
-                                if not self.user_spoke_again.is_set():  # Don't speak if immediately interrupted
+                                if not self.interrupt_event.is_set():  # Don't speak if immediately interrupted
                                     try:
-                                        await self.tts.speak("Okay, goodbye!", self.user_spoke_again)
+                                        await self.tts.speak("Okay, goodbye!", self.interrupt_event)
                                     except Exception as e:
                                         print(f"Error during goodbye message: {e}")
                                 self.is_running = False
                                 break
                             
-                            self.user_spoke_again.clear()  # Clear before starting new task
+                            self.interrupt_event.clear()  # Clear before starting new task
                             try:
                                 self.current_llm_task = asyncio.create_task(self.process_llm_and_speak(user_input))
                             except Exception as e:
@@ -581,7 +606,7 @@ class ConversationManager:
                     except Exception as e:
                         print(f"LLM task finished with error: {e}")
                     self.current_llm_task = None
-                    if self.is_running and not self.user_spoke_again.is_set():  # Only print Listening if not shutting down and not just interrupted
+                    if self.is_running and not self.interrupt_event.is_set():  # Only print Listening if not shutting down and not just interrupted
                          print("Listening...")
 
         except KeyboardInterrupt:
@@ -591,7 +616,7 @@ class ConversationManager:
             print(f"Critical error in main loop: {e}")
         finally:
             print("Cleaning up...")
-            self.user_spoke_again.set()  # Signal to any ongoing tasks to stop
+            self.interrupt_event.set()  # Signal to any ongoing tasks to stop
             if self.current_llm_task and not self.current_llm_task.done():
                 try:
                     self.current_llm_task.cancel()
@@ -619,12 +644,47 @@ class DeepgramTTS:
     def __init__(self, api_key):
         self.api_key = api_key
         # self.client = DeepgramClient(api_key) # Not used if using requests directly
+        self.temp_file = None
         self.player_process = None
-        self.play_command = ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", "-"]
-        # Check for ffplay availability or use afplay/aplay
-        # For macOS: self.play_command = ["afplay", "-"]
-        # For Linux (aplay): self.play_command = ["aplay", "-f", "S16_LE", "-r", "24000", "-"] # Example, adjust format/rate
-
+        self.is_playing = False
+        self.audio_data = None
+        
+    async def get_audio_data(self, text):
+        """Get audio data for text without playing it"""
+        # URL for Deepgram TTS API
+        DEEPGRAM_URL = "https://api.deepgram.com/v1/speak?model=aura-asteria-en"
+        
+        # Set up headers and payload for the TTS request
+        headers = {
+            "Authorization": f"Token {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {"text": text}
+        
+        # Send the request and get the response
+        response = await asyncio.to_thread(requests.post, DEEPGRAM_URL, headers=headers, json=payload, stream=True)
+        
+        # Check if request was successful
+        if response.status_code != 200:
+            print(f"Error: Failed to get audio from Deepgram TTS. Status code: {response.status_code}")
+            return b""
+        
+        # Return audio data as bytes iterator for streaming
+        async def audio_stream():
+            chunks = []
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    chunks.append(chunk)
+                    yield chunk
+            # Store audio data for later use
+            if chunks:
+                self.audio_data = b''.join(chunks)
+            else:
+                print(f"TTS: No audio data received from Deepgram for: {text}")
+                self.audio_data = None
+        
+        return audio_stream()
+        
     async def speak(self, text, interrupt_event=None):
         if not text:
             print("TTS: No text to speak.")
@@ -836,33 +896,124 @@ async def main_async(first_message=None, text_only=False):
         traceback.print_exc()
 
 async def shutdown(manager):
-    print("\nShutdown signal received, cleaning up...")
-    manager.is_running = False
-    # The manager's main loop will handle the rest
+    # Cancel all tasks
+    print("Shutting down... Cleaning up resources.")
+    if manager:
+        manager.cancel_tasks()
+    
+    # Sleep a bit to allow tasks to clean up
+    await asyncio.sleep(1)
+
+# API Endpoints
+@app.post("/chat")
+async def chat_endpoint(request: Request):
+    body = await request.body()
+    text = body.decode()
+    
+    # Initialize language model
+    llm = LanguageModelProcessor()
+    response, _ = await llm.generate_response(text)
+    return JSONResponse({"response": response})
+
+@app.post("/tts")
+async def tts_endpoint(request: Request):
+    body = await request.body()
+    text = body.decode()
+    
+    # Use Deepgram TTS
+    if not os.getenv("DEEPGRAM_API_KEY"):
+        return JSONResponse({"error": "DEEPGRAM_API_KEY not set"}, status_code=500)
+    
+    tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
+    audio_data = await tts.get_audio_data(text)
+    
+    # Return audio as streaming response
+    return StreamingResponse(audio_data, media_type="audio/mp3")
+
+# WebSocket for voice streaming
+@app.websocket("/voice/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    # Create a queue for communication between STT and this handler
+    transcription_queue = asyncio.Queue()
+    
+    # Initialize STT with the queue
+    stt = DeepgramSTT(transcription_queue)
+    
+    # Initialize LLM and TTS
+    llm = LanguageModelProcessor()
+    tts = DeepgramTTS(os.getenv("DEEPGRAM_API_KEY"))
+    
+    # Create conversation manager
+    manager = ConversationManager(llm, tts)
+    
+    # Start STT listening
+    await stt.start_listening()
+    
+    try:
+        # Start a background task to process transcription queue
+        process_task = asyncio.create_task(process_transcriptions(websocket, transcription_queue, manager))
+        
+        # Receive audio data from client and send to STT
+        while True:
+            data = await websocket.receive_bytes()
+            stt.connection.send(data)
+    
+    except WebSocketDisconnect:
+        print("WebSocket disconnected")
+    except Exception as e:
+        print(f"Error in WebSocket: {e}")
+    finally:
+        # Clean up
+        process_task.cancel()
+        await stt.stop_listening()
+        await websocket.close()
+
+async def process_transcriptions(websocket, queue, manager):
+    while True:
+        try:
+            # Get transcription from queue
+            transcription = await queue.get()
+            
+            # Format for sending to client
+            if isinstance(transcription, dict):
+                # Send transcription to client
+                await websocket.send_json({"type": "transcript", "text": transcription.get("text", ""), "is_final": transcription.get("is_final", False)})
+                
+                # Process with LLM and TTS if it's a final transcription
+                if transcription.get("is_final", False):
+                    response, audio_data = await manager.process_llm_and_speak(transcription.get("text", ""))
+                    
+                    if response and audio_data:
+                        # Send response text to client
+                        await websocket.send_json({"type": "response", "text": response})
+                        
+                        # Send audio data in chunks
+                        chunk_size = 8192
+                        for i in range(0, len(audio_data), chunk_size):
+                            chunk = audio_data[i:i+chunk_size]
+                            await websocket.send_bytes(chunk)
+            else:
+                # Simple string transcription
+                await websocket.send_json({"type": "transcript", "text": str(transcription), "is_final": True})
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Error processing transcription: {e}")
+            # Continue processing next transcription
+            continue
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Real-time Voice Assistant")
-    parser.add_argument("--first_message", type=str, default=None, help="A message for the agent to speak at the beginning.")
-    parser.add_argument("--text_only", action="store_true", help="Run in text-only mode (no TTS).")
-    # early_processing arg is removed as the new structure inherently aims for responsiveness
-    args = parser.parse_args() 
-
-    try:
-        asyncio.run(main_async(args.first_message, args.text_only))
-    except KeyboardInterrupt:
-        # This handler is now redundant with our signal handling, but kept for safety
-        print("Application terminated by user.")
-    except RuntimeError as e:
-        # Most common runtime errors during shutdown are related to event loops
-        # We'll handle them gracefully
-        if "Event loop is closed" in str(e):
-            print("Application successfully shut down.")
-        else:
-            print(f"Runtime error: {e}")
-            import traceback
-            traceback.print_exc()
-    except Exception as e:
-        # This top-level exception handler is good for catching unexpected issues
-        print(f"An unhandled critical exception occurred: {e}")
-        import traceback
-        traceback.print_exc() 
+    # Check if running directly or through uvicorn
+    if os.getenv("PORT"):
+        # Running on Render.com, use the PORT environment variable
+        port = int(os.getenv("PORT", 8000))
+        host = "0.0.0.0"
+    else:
+        # Local development
+        port = 8000
+        host = "127.0.0.1"
+    
+    # Run with uvicorn
+    uvicorn.run(app, host=host, port=port) 

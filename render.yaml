@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: realism-voice
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python QuickAgent.py
+    envVars:
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: RIME_API_KEY
+        sync: false
+      - key: DASHSCOPE_MODEL_NAME
+        value: qwen-plus
+      - key: RIME_SPEAKER
+        value: orion
+      - key: RIME_API_BASE
+        value: https://users.rime.ai/v1/rime-tts 
