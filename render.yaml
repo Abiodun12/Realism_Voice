@@ -17,4 +17,6 @@ services:
       - key: RIME_SPEAKER
         value: orion
       - key: RIME_API_BASE
-        value: https://users.rime.ai/v1/rime-tts 
+        value: https://users.rime.ai/v1/rime-tts
+      - key: PORT
+        value: 8000 

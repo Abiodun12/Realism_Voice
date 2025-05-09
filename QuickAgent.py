@@ -42,6 +42,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",          # local Next.js dev
         "https://your-site.vercel.app",   # replace with your real domain
+        "*",                              # Allow any origin for testing (you can remove this in production)
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -648,6 +649,7 @@ class DeepgramTTS:
         self.player_process = None
         self.is_playing = False
         self.audio_data = None
+        self.play_command = ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", "-"]
         
     async def get_audio_data(self, text):
         """Get audio data for text without playing it"""
