@@ -62,6 +62,10 @@
         // Audio context for proper audio formatting
         let audioContext;
         
+        // Add variables to track audio data collection
+        let collectingAudio = false;
+        let audioChunksReceived = [];
+        
         // Add message to the UI
         function addMessage(text, type) {
             if (type === 'debug' && !debugMode.checked) {
@@ -134,14 +138,46 @@
                         else if (data.type === 'response') {
                             addMessage(data.text, 'assistant');
                         }
+                        else if (data.type === 'audio_start') {
+                            // Start collecting audio chunks
+                            addMessage(`Starting to receive audio (${data.size} bytes expected)`, 'debug');
+                            collectingAudio = true;
+                            audioChunksReceived = [];
+                        }
+                        else if (data.type === 'audio_end') {
+                            // End of audio data, play it
+                            addMessage(`Finished receiving audio (${audioChunksReceived.length} chunks)`, 'debug');
+                            collectingAudio = false;
+                            
+                            if (audioChunksReceived.length > 0) {
+                                // Create a blob from all the chunks
+                                const audioBlob = new Blob(audioChunksReceived, { type: 'audio/mp3' });
+                                const audioUrl = URL.createObjectURL(audioBlob);
+                                
+                                // Play the audio
+                                const audio = new Audio();
+                                audio.src = audioUrl;
+                                audio.play();
+                                
+                                // Clear the chunks array
+                                audioChunksReceived = [];
+                            }
+                        }
                     } else {
                         // Binary data (audio)
-                        addMessage(`Received binary data: ${event.data.size} bytes`, 'debug');
-                        
-                        // Play audio
-                        const audio = new Audio();
-                        audio.src = URL.createObjectURL(new Blob([event.data], { type: 'audio/mp3' }));
-                        audio.play();
+                        if (collectingAudio) {
+                            // Add to our collection of chunks
+                            audioChunksReceived.push(event.data);
+                            addMessage(`Received audio chunk: ${event.data.size} bytes`, 'debug');
+                        } else {
+                            // Handle legacy format where audio is sent directly without start/end markers
+                            addMessage(`Received standalone audio data: ${event.data.size} bytes`, 'debug');
+                            
+                            // Play audio
+                            const audio = new Audio();
+                            audio.src = URL.createObjectURL(new Blob([event.data], { type: 'audio/mp3' }));
+                            audio.play();
+                        }
                     }
                 } catch (error) {
                     addMessage(`Error processing message: ${error.message}`, 'error');
