@@ -325,6 +325,7 @@ class DeepgramSTT:
             print("ERROR: DEEPGRAM_API_KEY environment variable is not set")
             raise ValueError("Missing Deepgram API key")
             
+        # Initialize Deepgram client with proper options
         config = DeepgramClientOptions(options={"keepalive": "true"})
         self.client = DeepgramClient(self.deepgram_api_key, config)
         self.dg_connection = None
@@ -345,21 +346,34 @@ class DeepgramSTT:
         if asyncio.get_event_loop() != self.loop:
             print("Warning: Event loop mismatch. This might cause issues.")
         
-        # Create the Deepgram connection - UPDATED to use asyncwebsocket instead of asynclive
+        # Create the Deepgram connection using the proper API method
         try:
-            # Update to use asyncwebsocket which is the recommended approach in Deepgram SDK 4.0.0+
-            print("Creating Deepgram websocket connection")
-            self.dg_connection = self.client.listen.asyncwebsocket.v("1")
+            # Create a live transcription connection - properly using listen.live
+            print("Creating Deepgram live connection")
+            self.dg_connection = self.client.listen.live({
+                "model": "nova-3",
+                "language": "en-US",
+                "smart_format": True,
+                "encoding": "linear16",
+                "channels": 1,
+                "sample_rate": 16000,
+                "interim_results": True,
+                "utterance_end_ms": 2000,
+                "vad_events": True,
+                "endpointing": 800,
+            })
             print("Created Deepgram connection")
         except Exception as e:
             print(f"Failed to create Deepgram connection: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
-        # Define async event handlers properly with correct signatures
-        async def on_open_async(**kwargs):
+        # Define the event handlers
+        async def on_open():
             print("Deepgram connection opened successfully.")
             
-        async def on_message_async(result, **kwargs):
+        async def on_message(result):
             # Only process if speech processing is enabled (not speaking)
             if not self.processing_enabled:
                 return
@@ -384,7 +398,7 @@ class DeepgramSTT:
             except Exception as e:
                 print(f"Error processing transcription message: {e}")
         
-        async def on_utterance_end_async(utterance_end, **kwargs):
+        async def on_utterance_end(utterance_end):
             # Only process if speech processing is enabled (not speaking)
             if not self.processing_enabled:
                 return
@@ -399,7 +413,7 @@ class DeepgramSTT:
             else:
                 print("UtteranceEnd received, but no transcript accumulated to send.")
         
-        async def on_speech_started_async(speech_started, **kwargs):
+        async def on_speech_started(speech_started):
             # Only process if speech processing is enabled (not speaking)
             if not self.processing_enabled:
                 return
@@ -407,10 +421,10 @@ class DeepgramSTT:
             print("User started speaking.")
             self.is_speaking = True
             
-        async def on_error_async(error, **kwargs):
+        async def on_error(error):
             print(f"Deepgram error: {error}")
             
-        async def on_close_async(**kwargs):
+        async def on_close():
             print("Deepgram connection closed.")
             if self.microphone and hasattr(self.microphone, 'is_alive') and self.microphone.is_alive():
                 try:
@@ -418,32 +432,18 @@ class DeepgramSTT:
                 except Exception as e:
                     print(f"Error finishing microphone in on_close: {e}")
 
-        # Register the async handlers with correct event names
-        self.dg_connection.on(LiveTranscriptionEvents.Open, on_open_async)
-        self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_message_async)
-        self.dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end_async)
-        self.dg_connection.on(LiveTranscriptionEvents.SpeechStarted, on_speech_started_async)
-        self.dg_connection.on(LiveTranscriptionEvents.Error, on_error_async)
-        self.dg_connection.on(LiveTranscriptionEvents.Close, on_close_async)
-
-        # Best options for processing WebSocket audio in a server environment
-        options = LiveOptions(
-            model="nova-3", # Use nova-3 for best results
-            language="en-US",
-            smart_format=True,
-            encoding="linear16", # Match with client's audio format
-            channels=1,
-            sample_rate=16000,   # Match with client's audio format
-            interim_results=True,
-            utterance_end_ms=2000, # Increased to 2000ms for more reliable end detection
-            vad_events=True,
-            endpointing=800,     # Increased to 800ms to better detect pauses
-        )
+        # Register event handlers according to Deepgram's API
+        self.dg_connection.on(LiveTranscriptionEvents.Open, on_open)
+        self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        self.dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
+        self.dg_connection.on(LiveTranscriptionEvents.SpeechStarted, on_speech_started)
+        self.dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+        self.dg_connection.on(LiveTranscriptionEvents.Close, on_close)
 
         print("Starting Deepgram connection...")
         # Start the connection
         try:
-            await self.dg_connection.start(options)
+            # No need to call start() separately as it's handled when we create the connection
             print("Deepgram connection started successfully")
             
             # Only create microphone in non-server environment
@@ -1096,8 +1096,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
                     
                 try:
-                    # CRITICAL FIX: Properly await the send method
-                    await stt.dg_connection.send(data)
+                    # Send audio data to Deepgram using the send method
+                    # Note: With the new API, send doesn't need to be awaited (it's not a coroutine)
+                    stt.dg_connection.send(data)
+                    
                     # Print occasional heartbeat to confirm data flow (not every chunk to avoid spamming logs)
                     if len(data) % 10000 < 100:  # Print roughly every 10KB
                         print(f"Sent audio chunk to Deepgram: {len(data)} bytes")
