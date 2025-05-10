@@ -48,7 +48,10 @@
         let audioChunks = [];
         let isRecording = false;
         let reconnectAttempts = 0;
-        let maxReconnectAttempts = 3;
+        let maxReconnectAttempts = 5;
+        let reconnectTimeout = null;
+        let connectionState = 'disconnected';
+        let microphoneState = 'disabled';
         
         const messagesDiv = document.getElementById('messages');
         const connectBtn = document.getElementById('connectBtn');
@@ -94,13 +97,56 @@
             return `${baseUrl}/${endpoint}`;
         }
         
+        // Update UI based on connection state
+        function updateUIForConnectionState() {
+            switch (connectionState) {
+                case 'connected':
+                    connectBtn.disabled = true;
+                    startBtn.disabled = false;
+                    sendTextBtn.disabled = false;
+                    addMessage('Connected!', 'system');
+                    break;
+                case 'connecting':
+                    connectBtn.disabled = true;
+                    startBtn.disabled = true;
+                    stopBtn.disabled = true;
+                    sendTextBtn.disabled = true;
+                    addMessage('Connecting to server...', 'system');
+                    break;
+                case 'disconnected':
+                case 'error':
+                    connectBtn.disabled = false;
+                    startBtn.disabled = true;
+                    stopBtn.disabled = true;
+                    sendTextBtn.disabled = true;
+                    break;
+            }
+            
+            // Also handle recording buttons based on microphone state
+            if (microphoneState === 'enabled') {
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+            } else if (microphoneState === 'disabled' && connectionState === 'connected') {
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+        }
+        
         // Connect to WebSocket
         connectBtn.addEventListener('click', () => {
             connectToServer();
         });
         
         function connectToServer() {
-            addMessage('Connecting to server...', 'system');
+            // Cancel any pending reconnect attempts
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+            
+            // Update state and UI
+            connectionState = 'connecting';
+            updateUIForConnectionState();
             
             // Close existing socket if any
             if (socket) {
@@ -113,10 +159,9 @@
             socket = new WebSocket(serverUrl);
             
             socket.onopen = () => {
-                addMessage('Connected!', 'system');
-                connectBtn.disabled = true;
-                startBtn.disabled = false;
-                sendTextBtn.disabled = false;
+                connectionState = 'connected';
+                microphoneState = 'disabled'; // Microphone starts disabled
+                updateUIForConnectionState();
                 reconnectAttempts = 0; // Reset reconnect counter on successful connection
             };
             
@@ -128,7 +173,31 @@
                         
                         addMessage(`Received message type: ${data.type}`, 'debug');
                         
-                        if (data.type === 'transcript') {
+                        if (data.type === 'connection' && data.status === 'ready') {
+                            // Connection confirmed from server
+                            microphoneState = data.microphone || 'disabled';
+                            updateUIForConnectionState();
+                        }
+                        else if (data.type === 'status') {
+                            // Status update from server
+                            addMessage(data.message, 'system');
+                            
+                            // Update microphone state if included
+                            if (data.microphone) {
+                                microphoneState = data.microphone;
+                                updateUIForConnectionState();
+                                
+                                // If microphone was enabled, start local recording
+                                if (microphoneState === 'enabled' && !isRecording) {
+                                    startRecording();
+                                }
+                                // If microphone was disabled, stop local recording
+                                else if (microphoneState === 'disabled' && isRecording) {
+                                    stopRecording();
+                                }
+                            }
+                        }
+                        else if (data.type === 'transcript') {
                             if (data.is_final) {
                                 addMessage(data.text, 'user');
                             } else {
@@ -163,6 +232,9 @@
                                 audioChunksReceived = [];
                             }
                         }
+                        else if (data.type === 'error') {
+                            addMessage(`Error from server: ${data.message}`, 'error');
+                        }
                     } else {
                         // Binary data (audio)
                         if (collectingAudio) {
@@ -186,29 +258,81 @@
             };
             
             socket.onclose = (event) => {
-                addMessage(`Disconnected from server (code: ${event.code}, reason: ${event.reason || 'none'})`, 'system');
-                connectBtn.disabled = false;
-                startBtn.disabled = true;
-                stopBtn.disabled = true;
-                sendTextBtn.disabled = true;
+                const wasConnected = connectionState === 'connected';
+                connectionState = 'disconnected';
+                microphoneState = 'disabled';
+                stopRecording(); // Make sure recording stops if active
+                updateUIForConnectionState();
                 
-                // Try to reconnect if unexpectedly closed and not max attempts
-                if (!event.wasClean && reconnectAttempts < maxReconnectAttempts) {
+                let reason = event.reason || 'No reason provided';
+                addMessage(`Disconnected from server (code: ${event.code}, reason: ${reason})`, 'system');
+                
+                // Try to reconnect automatically if:
+                // 1. We were previously connected (not during a manual connection attempt)
+                // 2. The close wasn't clean 
+                // 3. We haven't exceeded max attempts
+                if (wasConnected && !event.wasClean && reconnectAttempts < maxReconnectAttempts) {
                     reconnectAttempts++;
-                    const delay = reconnectAttempts * 2000; // Increasing backoff
+                    const delay = Math.min(30000, reconnectAttempts * 2000); // Increasing backoff, max 30 seconds
                     addMessage(`Attempting to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`, 'system');
-                    setTimeout(connectToServer, delay);
+                    
+                    // Set timeout for reconnection
+                    reconnectTimeout = setTimeout(() => {
+                        if (connectionState !== 'connected') { 
+                            addMessage(`Attempting reconnection...`, 'system');
+                            connectToServer();
+                        }
+                    }, delay);
+                } else if (reconnectAttempts >= maxReconnectAttempts) {
+                    addMessage(`Maximum reconnection attempts (${maxReconnectAttempts}) reached. Please reconnect manually.`, 'error');
                 }
             };
             
             socket.onerror = (error) => {
+                connectionState = 'error';
+                updateUIForConnectionState();
                 addMessage(`WebSocket error: ${error.message || 'Connection failed'}`, 'error');
                 console.error('WebSocket error:', error);
             };
         }
         
-        // Start recording
+        // Send a command to the server
+        function sendCommand(command) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ text: `/${command}` }));
+                addMessage(`Sent command: /${command}`, 'debug');
+                return true;
+            } else {
+                addMessage('Cannot send command: WebSocket not connected', 'error');
+                return false;
+            }
+        }
+        
+        // Start recording - first enables microphone on server, then starts local recording
         startBtn.addEventListener('click', async () => {
+            if (connectionState === 'connected') {
+                // Send command to enable microphone on server
+                if (sendCommand('mic_on')) {
+                    addMessage('Requesting microphone activation...', 'system');
+                    // Actual recording will be started when server confirms microphone is enabled
+                }
+            }
+        });
+        
+        // Stop recording - stops local recording and disables microphone on server
+        stopBtn.addEventListener('click', () => {
+            if (connectionState === 'connected') {
+                // Stop local recording
+                stopRecording();
+                
+                // Send command to disable microphone on server
+                sendCommand('mic_off');
+                addMessage('Stopping recording...', 'system');
+            }
+        });
+        
+        // Start local recording
+        async function startRecording() {
             try {
                 // Initialize audio context if needed
                 if (!audioContext) {
@@ -242,10 +366,12 @@
                             // Convert to raw audio and send to server
                             const arrayBuffer = await event.data.arrayBuffer();
                             if (socket && socket.readyState === WebSocket.OPEN) {
+                                // Send binary data directly
                                 socket.send(arrayBuffer);
                                 addMessage(`Sent ${arrayBuffer.byteLength} bytes to server`, 'debug');
                             } else {
                                 addMessage('Cannot send audio: WebSocket not connected', 'error');
+                                stopRecording(); // Stop recording if socket is closed
                             }
                         } catch (error) {
                             addMessage(`Error sending audio: ${error.message}`, 'error');
@@ -255,7 +381,7 @@
                 };
                 
                 mediaRecorder.onstop = () => {
-                    addMessage('Recording stopped', 'system');
+                    addMessage('Local recording stopped', 'debug');
                     stream.getTracks().forEach(track => track.stop());
                 };
                 
@@ -263,65 +389,43 @@
                 mediaRecorder.start(300); // Collect data in 300ms chunks
                 isRecording = true;
                 addMessage('Recording started...', 'system');
-                
-                startBtn.disabled = true;
-                stopBtn.disabled = false;
+                updateUIForConnectionState();
             } catch (error) {
                 addMessage(`Error accessing microphone: ${error.message}`, 'error');
                 console.error('Microphone access error:', error);
+                // If we fail to start recording locally, tell the server to disable microphone
+                sendCommand('mic_off');
+                microphoneState = 'disabled';
+                updateUIForConnectionState();
             }
-        });
+        }
         
-        // Stop recording
-        stopBtn.addEventListener('click', () => {
+        // Stop local recording
+        function stopRecording() {
             if (mediaRecorder && isRecording) {
                 mediaRecorder.stop();
                 isRecording = false;
-                startBtn.disabled = false;
-                stopBtn.disabled = true;
+                microphoneState = 'disabled';
+                updateUIForConnectionState();
             }
-        });
+        }
         
         // Send text (for testing without microphone)
         sendTextBtn.addEventListener('click', async () => {
             const text = textInput.value.trim();
-            if (text) {
-                // Use the /chat endpoint instead of WebSocket for text
-                try {
-                    addMessage('Sending text...', 'system');
-                    const response = await fetch(getApiUrl('chat'), {
-                        method: 'POST',
-                        body: text
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
+            if (text && connectionState === 'connected') {
+                if (text.startsWith('/')) {
+                    // It's a command, send it directly through WebSocket
+                    sendCommand(text.substring(1));
+                } else {
+                    // Regular text - send through WebSocket
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ text }));
+                        addMessage(text, 'user');
+                        textInput.value = '';
+                    } else {
+                        addMessage('Cannot send text: WebSocket not connected', 'error');
                     }
-                    
-                    const data = await response.json();
-                    addMessage(text, 'user');
-                    addMessage(data.response, 'assistant');
-                    
-                    // Get TTS audio for the response
-                    const ttsResponse = await fetch(getApiUrl('tts'), {
-                        method: 'POST',
-                        body: data.response
-                    });
-                    
-                    if (!ttsResponse.ok) {
-                        throw new Error(`TTS server responded with ${ttsResponse.status}: ${ttsResponse.statusText}`);
-                    }
-                    
-                    // Play audio
-                    const audioBlob = await ttsResponse.blob();
-                    const audio = new Audio();
-                    audio.src = URL.createObjectURL(audioBlob);
-                    audio.play();
-                    
-                    textInput.value = '';
-                } catch (error) {
-                    addMessage(`Error: ${error.message}`, 'error');
-                    console.error('Text sending error:', error);
                 }
             }
         });
