@@ -378,9 +378,9 @@ class DeepgramSTT:
                 channels=1, 
                 sample_rate=16000,
                 interim_results=True,
-                utterance_end_ms=1000,  # Must be at least 1000ms
+                utterance_end_ms=500,  # Reduced from 1000ms to 500ms for faster response
                 vad_events=True,
-                endpointing=800
+                endpointing=500  # Reduced from 800ms to 500ms for faster response
             )
             
             # Create API connection using the pattern for SDK 4.x
@@ -410,11 +410,9 @@ class DeepgramSTT:
                             # If thread is interrupted or connection is closed, break the loop
                             break
                 
-                # Start the keepalive thread if we're in a server environment 
-                # where the connection needs to stay open for long periods
-                if self.is_server_env:
-                    keepalive_thread = threading.Thread(target=start_keepalive, daemon=True)
-                    keepalive_thread.start()
+                # Start the keepalive thread
+                keepalive_thread = threading.Thread(target=start_keepalive, daemon=True)
+                keepalive_thread.start()
                 
                 # Define event handlers - callback style for SDK 4.x
                 def on_open(client, event, **kwargs):
@@ -434,6 +432,20 @@ class DeepgramSTT:
                             return
                             
                         sentence = result.channel.alternatives[0].transcript
+                        
+                        # Print info about the transcript type to help debug
+                        if hasattr(result, 'is_final'):
+                            is_final = result.is_final
+                        else:
+                            is_final = False
+                            
+                        if hasattr(result, 'speech_final'):
+                            speech_final = result.speech_final
+                        else:
+                            speech_final = False
+                            
+                        if sentence.strip():
+                            print(f"Transcript: '{sentence.strip()}' (is_final: {is_final}, speech_final: {speech_final})")
                         
                         if result.is_final and result.speech_final:
                             if sentence.strip():
@@ -463,6 +475,15 @@ class DeepgramSTT:
                         
                     print("\nUser likely finished speaking (UtteranceEnd).")
                     outer_self.is_speaking = False # User has stopped.
+                    
+                    # Send CloseStream message to ensure Deepgram finalizes processing
+                    try:
+                        if hasattr(outer_self.dg_connection, 'send_message'):
+                            outer_self.dg_connection.send_message({"type": "CloseStream"})
+                            print("Sent CloseStream message to finalize processing")
+                    except Exception as e:
+                        print(f"Error sending CloseStream: {e}")
+                        
                     if len(outer_self.accumulated_transcript.strip()) > 0:
                         try:
                             # Instead of using create_task, add to the queue directly in non-async context
@@ -635,6 +656,25 @@ class DeepgramSTT:
         self.accumulated_transcript = ""
         self.dg_connection = None
         self.microphone = None
+
+    async def send_to_deepgram(self, audio_data):
+        """Send audio data to Deepgram and track metrics"""
+        if not self.dg_connection:
+            print("Error: Deepgram connection is None, cannot send data")
+            return False
+        
+        try:
+            # Send audio data to Deepgram
+            # With SDK 4.x, send is not awaitable
+            self.dg_connection.send(audio_data)
+            
+            # Set a flag that we've sent data
+            self.last_audio_sent_time = time.time()
+            
+            return True
+        except Exception as e:
+            print(f"Error sending data to Deepgram: {e}")
+            return False
 
 class ConversationManager:
     def __init__(self, llm, tts, stt=None):
@@ -1190,6 +1230,11 @@ async def websocket_endpoint(websocket: WebSocket):
     # Create conversation manager
     manager = ConversationManager(llm, tts, stt)
     
+    # Variables to track audio activity
+    last_audio_received = time.time()
+    audio_chunks_received = 0
+    audio_size_total = 0
+    
     # Start STT listening but DON'T enable microphone by default
     try:
         print("Starting STT listening...")
@@ -1231,7 +1276,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     data = await asyncio.wait_for(websocket.receive(), timeout=0.5)
                     message_type = data.get("type", "unknown")
-                    print(f"Received message type: {message_type}")
                     
                     # Check for disconnect message
                     if message_type == "websocket.disconnect":
@@ -1273,6 +1317,19 @@ async def websocket_endpoint(websocket: WebSocket):
                                         else:
                                             print("Failed to disable microphone")
                                             await websocket.send_json({"type": "error", "message": "Failed to disable microphone"})
+                                    
+                                    elif command == "diagnostics":
+                                        # Send diagnostic information to client
+                                        diag_info = {
+                                            "type": "diagnostics",
+                                            "audio_chunks": audio_chunks_received,
+                                            "audio_size": audio_size_total,
+                                            "last_audio": time.time() - last_audio_received,
+                                            "stt_connection": stt.dg_connection is not None,
+                                            "microphone_enabled": stt.microphone_enabled
+                                        }
+                                        await websocket.send_json(diag_info)
+                                        await websocket.send_json({"type": "status", "message": "Diagnostics sent"})
                                             
                                     else:
                                         print(f"Unknown command: {command}")
@@ -1292,25 +1349,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         elif "bytes" in data:
                             # Process binary data (audio)
                             audio_data = data["bytes"]
-                            print(f"Received binary audio data: {len(audio_data)} bytes")
+                            audio_size = len(audio_data)
+                            audio_chunks_received += 1
+                            audio_size_total += audio_size
+                            last_audio_received = time.time()
                             
-                            if not stt.dg_connection:
-                                print("Error: Deepgram connection is None, cannot send data")
-                                break
-                                
-                            try:
-                                # Send audio data to Deepgram
-                                # With SDK 4.x, send is not awaitable
-                                stt.dg_connection.send(audio_data)
-                                
-                                # Print occasional heartbeat to confirm data flow (not every chunk to avoid spamming logs)
-                                if len(audio_data) % 10000 < 100:  # Print roughly every 10KB
-                                    print(f"Sent audio chunk to Deepgram: {len(audio_data)} bytes")
-                            except Exception as e:
-                                print(f"Error sending data to Deepgram: {e}")
-                                import traceback
-                                traceback.print_exc()
-                                break
+                            # Only log occasionally to avoid spamming the console
+                            if audio_chunks_received % 20 == 0:
+                                print(f"Received {audio_chunks_received} audio chunks ({audio_size_total} bytes total)")
+                            
+                            # Send to Deepgram
+                            await stt.send_to_deepgram(audio_data)
                         else:
                             print(f"Unsupported message content: {data}")
                     else:
@@ -1322,6 +1371,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     if process_task and process_task.done():
                         print("Processing task has ended unexpectedly")
                         break
+                    
+                    # Check if we need to send a keepalive message to Deepgram
+                    # This helps prevent the connection from timing out
+                    if stt.dg_connection:
+                        now = time.time()
+                        # If we haven't sent a keepalive in the last 5 seconds
+                        if hasattr(stt, 'last_keepalive_time') and now - stt.last_keepalive_time > 5:
+                            try:
+                                if hasattr(stt.dg_connection, 'send_message'):
+                                    stt.dg_connection.send_message({"type": "KeepAlive"})
+                                    stt.last_keepalive_time = now
+                                    print("Sent explicit keepalive to Deepgram from main loop")
+                            except Exception as e:
+                                print(f"Error sending keepalive: {e}")
+                    
                     continue
             except WebSocketDisconnect:
                 print("WebSocket disconnected during receive")
@@ -1387,16 +1451,20 @@ async def process_transcriptions(websocket, queue, manager):
             # Format for sending to client
             if isinstance(transcription, dict):
                 # Send transcription to client
-                await websocket.send_json({
-                    "type": "transcript", 
-                    "text": transcription.get("text", ""), 
-                    "is_final": transcription.get("is_final", False),
-                    "timestamp": transcription.get("timestamp", time.time())
-                })
-                print(f"Sent transcript to client: {transcription.get('text', '')}")
+                try:
+                    await websocket.send_json({
+                        "type": "transcript", 
+                        "text": transcription.get("text", ""), 
+                        "is_final": transcription.get("is_final", False),
+                        "timestamp": transcription.get("timestamp", time.time())
+                    })
+                    print(f"Sent transcript to client: {transcription.get('text', '')}")
+                except Exception as e:
+                    print(f"Error sending transcript to client: {e}")
+                    continue
                 
                 # Process with LLM and TTS if it's a final transcription
-                if transcription.get("is_final", False):
+                if transcription.get("is_final", False) and transcription.get("text", "").strip():
                     try:
                         # Get text from transcription
                         input_text = transcription.get("text", "")
@@ -1405,15 +1473,21 @@ async def process_transcriptions(websocket, queue, manager):
                             continue
                             
                         # Send processing status to client
-                        await websocket.send_json({"type": "status", "message": "Processing with AI..."})
+                        try:
+                            await websocket.send_json({"type": "status", "message": "Processing with AI..."})
+                        except Exception as e:
+                            print(f"Error sending processing status: {e}")
                             
                         print(f"Processing with LLM: {input_text}")
                         response, audio_data = await manager.process_llm_and_speak(input_text)
                         
                         if response:
                             # Send response text to client
-                            await websocket.send_json({"type": "response", "text": response})
-                            print(f"Sent response to client: {response}")
+                            try:
+                                await websocket.send_json({"type": "response", "text": response})
+                                print(f"Sent response to client: {response}")
+                            except Exception as e:
+                                print(f"Error sending response text: {e}")
                             
                             # Send audio data in chunks if available
                             if audio_data:
@@ -1439,12 +1513,18 @@ async def process_transcriptions(websocket, queue, manager):
                                     print(f"Error sending audio data: {e}")
                         else:
                             print("No response from LLM")
-                            await websocket.send_json({"type": "status", "message": "No response generated"})
+                            try:
+                                await websocket.send_json({"type": "status", "message": "No response generated"})
+                            except Exception as e:
+                                print(f"Error sending no response status: {e}")
                     except Exception as e:
                         print(f"Error processing with LLM: {e}")
                         import traceback
                         traceback.print_exc()
-                        await websocket.send_json({"type": "error", "message": "Error processing your request"})
+                        try:
+                            await websocket.send_json({"type": "error", "message": "Error processing your request"})
+                        except Exception as send_e:
+                            print(f"Error sending error message: {send_e}")
             else:
                 # Regular text message - process as user input
                 # This allows testing with typed inputs even when mic is off
