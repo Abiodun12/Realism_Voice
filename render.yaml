@@ -27,6 +27,9 @@ services:
       paths:
         - requirements.txt
     autoDeploy: false
+    # Keep service alive with regular health checks
+    healthCheckPath: /health
+    healthCheckTimeout: 5s
     # Add system packages required for PyAudio
     preInstallCommands:
       - apt-get update -y

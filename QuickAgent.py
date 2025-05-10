@@ -52,6 +52,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add a health check endpoint for Render to prevent spinning down
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "timestamp": time.time()}
+
 # Make sure to load environment variables with explicit path
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
