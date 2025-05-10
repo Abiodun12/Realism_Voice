@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import threading
 import json
+import starlette.websockets
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.memory import ConversationBufferMemory
@@ -383,6 +384,33 @@ class DeepgramSTT:
                 connection = self.client.listen.websocket.v("1")
                 self.dg_connection = connection
                 
+                # Set up a keepalive task to prevent the Deepgram connection from timing out
+                # We'll run this in a separate thread to not block the main event loop
+                def start_keepalive():
+                    print("Starting Deepgram keepalive thread")
+                    while True:
+                        try:
+                            time.sleep(5)  # Send keepalive every 5 seconds
+                            # Only send if connection exists and we're not in the process of closing it
+                            if self.dg_connection and hasattr(self.dg_connection, 'send_message'):
+                                try:
+                                    # Try to send a keepalive message
+                                    self.dg_connection.send_message({"type": "KeepAlive"})
+                                    print("Sent Deepgram keepalive ping")
+                                except:
+                                    # If it fails, the connection might be closed or in an invalid state
+                                    # This is expected during shutdown so we'll just pass
+                                    pass
+                        except:
+                            # If thread is interrupted or connection is closed, break the loop
+                            break
+                
+                # Start the keepalive thread if we're in a server environment 
+                # where the connection needs to stay open for long periods
+                if self.is_server_env:
+                    keepalive_thread = threading.Thread(target=start_keepalive, daemon=True)
+                    keepalive_thread.start()
+                
                 # Define event handlers - callback style for SDK 4.x
                 def on_open(client, event, **kwargs):
                     print(f"Deepgram connection opened successfully: {event}")
@@ -519,10 +547,14 @@ class DeepgramSTT:
             print("Microphone already active")
             return True
             
+        # Check if we're in a server environment (e.g., Render.com)
         if self.is_server_env:
-            print("Cannot enable microphone in server environment")
-            return False
-            
+            # In server environment, we don't need a physical mic but should still accept audio via WebSocket
+            print("Server environment detected - continuing without physical microphone")
+            self.microphone_enabled = True  # Mark as enabled to process incoming audio
+            return True  # Return success
+        
+        # For local environment, try to access the physical microphone
         try:
             self.microphone = Microphone(self.dg_connection.send)
             self.microphone.start()
@@ -1173,8 +1205,14 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Error starting STT: {e}")
         import traceback
         traceback.print_exc()
-        await websocket.close(1011, "Failed to start speech recognition")
+        try:
+            await websocket.close(1011, "Failed to start speech recognition")
+        except Exception as close_err:
+            print(f"Error during close after initialization error: {close_err}")
         return
+    
+    # Create a task for processing transcriptions
+    process_task = None
     
     try:
         # Start a background task to process transcription queue
@@ -1189,6 +1227,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     data = await asyncio.wait_for(websocket.receive(), timeout=0.5)
                     message_type = data.get("type", "unknown")
                     print(f"Received message type: {message_type}")
+                    
+                    # Check for disconnect message
+                    if message_type == "websocket.disconnect":
+                        print(f"Received disconnect message: {data}")
+                        break
                     
                     # Handle text messages (commands and text input)
                     if message_type == "websocket.receive":
@@ -1271,12 +1314,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 except asyncio.TimeoutError:
                     # No data received in timeout period - this is normal
                     # Check if process_task is still running
-                    if process_task.done():
+                    if process_task and process_task.done():
                         print("Processing task has ended unexpectedly")
                         break
                     continue
             except WebSocketDisconnect:
                 print("WebSocket disconnected during receive")
+                break
+            except starlette.websockets.WebSocketDisconnect:
+                # Also catch starlette's WebSocketDisconnect specifically
+                print("Starlette WebSocket disconnected during receive")
                 break
             except Exception as e:
                 print(f"Error receiving data from WebSocket: {e}")
@@ -1291,17 +1338,32 @@ async def websocket_endpoint(websocket: WebSocket):
         import traceback
         traceback.print_exc()
     finally:
-        # Clean up
+        # Clean up - make sure these operations are safe even if the websocket is already closed
         print("Cleaning up WebSocket resources...")
-        if 'process_task' in locals() and process_task:
+        
+        # Cancel the processing task if it's running
+        if process_task and not process_task.done():
             process_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(process_task), timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass  # Expected
-                
-        await stt.stop_listening()
-        await websocket.close()
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
+                print(f"Error during process task cancellation (non-critical): {e}")
+        
+        # Stop STT listening
+        try:
+            await stt.stop_listening()
+        except Exception as e:
+            print(f"Error stopping STT (non-critical): {e}")
+        
+        # Attempt to close the websocket if it's not already closed
+        try:
+            await websocket.close()
+        except RuntimeError as e:
+            # This is expected if the websocket is already closed
+            print(f"Note: WebSocket was already closed: {e}")
+        except Exception as e:
+            print(f"Error during websocket.close (non-critical): {e}")
+            
         print("WebSocket cleanup complete")
 
 async def process_transcriptions(websocket, queue, manager):
@@ -1382,7 +1444,7 @@ async def process_transcriptions(websocket, queue, manager):
                 # Regular text message - process as user input
                 # This allows testing with typed inputs even when mic is off
                 print(f"Adding text to transcription queue: {transcription}")
-                transcription_queue.put_nowait({
+                queue.put_nowait({
                     "text": transcription,
                     "is_final": True,
                     "timestamp": time.time()

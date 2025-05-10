@@ -259,6 +259,25 @@ The system now enforces a 60-token limit (approximately 120 characters) on respo
 
 This token limit can be adjusted in the `QuickAgent.py` file by modifying the `max_tokens` parameter in the LLM calls.
 
+## Recent Fixes
+
+### TTS System Fix
+Fixed an issue where the WebSocket endpoint was correctly initializing the Rime TTS, but the ConversationManager was ignoring it and always creating a new DeepgramTTS instance. This caused the system to:
+- Log "Using Rime TTS for WebSocket" but actually use Deepgram TTS
+- Ignore the configured TTS provider preferences
+
+The fix ensures that the ConversationManager now properly uses the TTS instance that was passed to it during initialization.
+
+### WebSocket Client Improvements
+Enhanced the WebSocket client's connection handling and reconnection logic with:
+- Explicit connection state tracking ('connecting', 'connected', 'disconnected', 'error')
+- Better UI state management based on connection state
+- More robust reconnection mechanism with improved backoff timing
+- Increased maximum reconnection attempts from 3 to 5
+- Improved error handling and user feedback
+
+These changes should make the WebSocket connection more reliable and provide a better user experience during connection issues.
+
 ## License
 
 [Your License]
