@@ -348,20 +348,29 @@ class DeepgramSTT:
         
         # Create the Deepgram connection using the proper API method
         try:
-            # Create a live transcription connection - properly using listen.live
+            # Create a live transcription connection - using the correct API format
             print("Creating Deepgram live connection")
-            self.dg_connection = self.client.listen.live({
-                "model": "nova-3",
-                "language": "en-US",
-                "smart_format": True,
-                "encoding": "linear16",
-                "channels": 1,
-                "sample_rate": 16000,
-                "interim_results": True,
-                "utterance_end_ms": 2000,
-                "vad_events": True,
-                "endpointing": 800,
-            })
+            
+            # Get the version 1 of the live API
+            connection = self.client.listen.live.v("1")
+            
+            # Create options object
+            options = LiveOptions(
+                model="nova-3",
+                language="en-US", 
+                smart_format=True,
+                encoding="linear16",
+                channels=1, 
+                sample_rate=16000,
+                interim_results=True,
+                utterance_end_ms=2000,
+                vad_events=True,
+                endpointing=800
+            )
+            
+            # Start the connection with options
+            self.dg_connection = connection
+            await self.dg_connection.start(options)
             print("Created Deepgram connection")
         except Exception as e:
             print(f"Failed to create Deepgram connection: {e}")
