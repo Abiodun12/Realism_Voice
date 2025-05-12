@@ -268,7 +268,7 @@ async def get_transcript(callback, interim_callback=None):
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
         options = LiveOptions(
-            model="nova-3",  # Upgrade to latest Deepgram model 
+            model="nova-3",  # Changed from nova-2 to nova-3
             punctuate=True,
             language="en-US",
             encoding="linear16",
@@ -299,79 +299,123 @@ async def get_transcript(callback, interim_callback=None):
 
 class DeepgramSTT:
     def __init__(self, manager_queue):
+        # Ensure DEEPGRAM_API_KEY is loaded and available
+        self.api_key = os.getenv("DEEPGRAM_API_KEY")
+        if not self.api_key:
+            print("Error: DEEPGRAM_API_KEY environment variable is not set. STT will not function.")
+            # Consider raising an error or having a more robust way to handle this
+        
+        # Configure Deepgram client
+        # Options for keepalive, etc., can be set here
+        self.client_config = DeepgramClientOptions(
+            options={"keepalive": "true"} 
+        )
+        self.client = DeepgramClient(self.api_key if self.api_key else "", self.client_config) # Pass empty string if no key, though SDK might handle None
+
         self.manager_queue = manager_queue
-        config = DeepgramClientOptions(options={"keepalive": "true"})
-        self.client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"), config)
-        self.dg_connection = None
+        self.is_listening = False
         self.microphone = None
-        self.is_speaking = False
-        self.accumulated_transcript = ""
-        self.processing_enabled = True  # Flag to enable/disable transcript processing
-        # Store the event loop that this object was created on
-        self.loop = asyncio.get_event_loop()
+        self.dg_connection = None
+        self.transcript_collector = TranscriptCollector()
+        self.utterance_end_timer = None
+        self.speech_started = False
+        self.speech_processing_enabled = True # Control flag
+        self.active_audio_task = None # To keep track of the audio processing task
 
     async def start_listening(self):
-        # Ensure we're on the same event loop
-        if asyncio.get_event_loop() != self.loop:
-            print("Warning: Event loop mismatch. This might cause issues.")
-        
-        # The configuration was moved to the client initialization in __init__
-        self.dg_connection = self.client.listen.asynclive.v("1")
+        if not self.api_key:
+            print("Deepgram API key not set. STT cannot start.")
+            return
 
-        # Fix: Define async event handlers properly
-        async def on_open_async(connection, **kwargs):
-            print("Deepgram connection opened.")
-            
-        async def on_message_async(connection, result, **kwargs):
-            # Only process if speech processing is enabled (not speaking)
-            if not self.processing_enabled:
-                return
-                
+        # Use the recommended asyncwebsocket
+        self.dg_connection = self.client.listen.asyncwebsocket.v("1")
+
+        # Define event handlers. The SDK passes the client instance as the first argument
+        # to these callbacks, even if they are nested functions.
+        async def on_open_async(client_instance, open_payload, **kwargs):
+            print(f"Deepgram connection opened via: {client_instance}")
+            print(f"Deepgram on_open_async PAYLOAD: {open_payload}")
+            self.is_listening = True # Explicitly set is_listening to True on successful open
+            # request_id = open_payload.headers.get("dg-request-id") # Example if payload has headers
+            # print(f"Request ID: {request_id}")
+
+        async def on_message_async(client_instance, result, **kwargs):
+            if not self.is_listening or not self.speech_processing_enabled:
+                return # Ignore transcripts if not actively listening or speech processing is disabled
+
             sentence = result.channel.alternatives[0].transcript
-            
-            if result.is_final and result.speech_final:
-                self.accumulated_transcript = result.channel.alternatives[0].transcript
-                pass
-            elif not result.is_final and len(sentence) > 0: # Interim result
-                current_transcript_interim = result.channel.alternatives[0].transcript
-                print(f"Hearing: {current_transcript_interim}...", end='\r', flush=True)
-                self.accumulated_transcript = current_transcript_interim
-        
-        async def on_utterance_end_async(connection, utterance_end, **kwargs):
-            # Only process if speech processing is enabled (not speaking)
-            if not self.processing_enabled:
+            if not sentence.strip():
                 return
-                
-            print("\nUser likely finished speaking (UtteranceEnd).")
-            self.is_speaking = False # User has stopped.
-            if len(self.accumulated_transcript.strip()) > 0:
-                try:
-                    await self.send_to_manager_async()
-                except Exception as e:
-                    print(f"Error sending transcript to manager: {e}")
-            else:
-                print("UtteranceEnd received, but no transcript accumulated to send.")
-        
-        async def on_speech_started_async(connection, speech_started, **kwargs):
-            # Only process if speech processing is enabled (not speaking)
-            if not self.processing_enabled:
-                return
-                
-            print("User started speaking.")
-            self.is_speaking = True
-            
-        async def on_error_async(connection, error, **kwargs):
-            print(f"Deepgram error: {error}")
-            
-        async def on_close_async(connection, **kwargs):
-            print("Deepgram connection closed.")
-            if self.microphone and hasattr(self.microphone, 'is_alive') and self.microphone.is_alive():
-                try:
-                    self.microphone.finish()
-                except Exception as e:
-                    print(f"Error finishing microphone in on_close: {e}")
 
-        # Register the async handlers
+            if result.is_final:
+                self.transcript_collector.add_part(sentence)
+                if result.speech_final:
+                    full_transcript = self.transcript_collector.get_full_transcript().strip()
+                    if full_transcript:
+                        print(f"Human: {full_transcript}")
+                        await self.manager_queue.put({'type': 'user_speech', 'data': full_transcript})
+                        self.transcript_collector.reset()
+                        self.speech_started = False
+                    if self.utterance_end_timer:
+                        self.utterance_end_timer.cancel()
+                        self.utterance_end_timer = None
+                else:
+                    pass # is_final but not speech_final, collected.
+            else: # Interim result
+                interim_transcript = sentence.strip()
+                if interim_transcript:
+                    if self.utterance_end_timer:
+                        self.utterance_end_timer.cancel()
+                    self.utterance_end_timer = asyncio.create_task(self.send_to_manager_after_delay(1.0))
+
+        async def on_utterance_end_async(client_instance, utterance_end, **kwargs):
+            if not self.speech_processing_enabled:
+                return
+            # Add guard for is_listening here as well
+            if not self.is_listening:
+                return
+            print("User likely finished speaking (UtteranceEnd).")
+            if self.speech_started and not self.utterance_end_timer:
+                full_transcript = self.transcript_collector.get_full_transcript().strip()
+                if full_transcript:
+                    print(f"Human (from UtteranceEnd): {full_transcript}")
+                    await self.manager_queue.put({'type': 'user_speech', 'data': full_transcript})
+                    self.transcript_collector.reset()
+                self.speech_started = False
+
+        async def on_speech_started_async(client_instance, *, speech_started, **kwargs):
+            # Signature based on observed SDK behavior: client_instance as pos arg,
+            # and speech_started_payload (SpeechStartedResponse) as a kwarg.
+            if not self.speech_processing_enabled:
+                return
+            print(f"User started speaking (client: {client_instance}, payload: {speech_started}).")
+            self.speech_started = True
+            if self.utterance_end_timer:
+                self.utterance_end_timer.cancel()
+                self.utterance_end_timer = None
+
+        async def on_error_async(client_instance, error, **kwargs):
+            print(f"Deepgram error (via client {client_instance}): {error}")
+            if hasattr(error, 'message'):
+                print(f"Error message: {error.message}")
+            # For websockets.exceptions.InvalidStatusCode, headers are on the exception object itself
+            if hasattr(error, 'headers'):
+                 dg_error_msg = error.headers.get("dg-error")
+                 dg_request_id = error.headers.get("dg-request-id")
+                 if dg_error_msg:
+                     print(f"dg-error header: {dg_error_msg}")
+                 if dg_request_id:
+                     print(f"dg-request-id header: {dg_request_id}")
+            # For other types of errors, the structure might be different.
+            # Consider logging the type of error: print(f"Error type: {type(error)}")
+
+        async def on_close_async(client_instance, *, close, **kwargs):
+            # Signature based on observed SDK behavior: client_instance as pos arg,
+            # and close_payload (CloseResponse) as a kwarg.
+            print(f"Deepgram connection closed by {client_instance}. Payload: {close}")
+            self.is_listening = False
+
+        # Register event handlers
         self.dg_connection.on(LiveTranscriptionEvents.Open, on_open_async)
         self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_message_async)
         self.dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end_async)
@@ -379,52 +423,59 @@ class DeepgramSTT:
         self.dg_connection.on(LiveTranscriptionEvents.Error, on_error_async)
         self.dg_connection.on(LiveTranscriptionEvents.Close, on_close_async)
 
-        # More focused options for accurate speech detection
         options = LiveOptions(
-            model="nova-2", # or nova-3 if available and preferred
+            model="nova-3", # Changed from nova-2 to nova-3
             language="en-US",
             smart_format=True,
-            encoding="linear16", # Make sure this matches your microphone
-            channels=1,
-            sample_rate=16000,   # Make sure this matches your microphone
-            interim_results=True,
-            utterance_end_ms=1500, # Increased from 1000ms to 1500ms to avoid premature end detection
-            vad_events=True,
-            endpointing=500,     # Increased from 300ms to 500ms to wait longer for more speech
+            punctuate=True,
+            interim_results=True, # Get interim results for faster feedback
+            utterance_end_ms="1000", # How long to wait for UtteranceEnd after speech
+            vad_events=True, # Voice Activity Detection events (SpeechStarted, UtteranceEnd)
+            sample_rate=16000, # Ensure this matches your microphone's sample rate
+            encoding="linear16",
+            channels=1
         )
 
-        print("Listening...")
-        # The start method in AsyncLive version does need an await
         try:
-            await self.dg_connection.start(options)
-            
-            # Create and start microphone after successful connection
-            try:
-                # Store the current event loop to ensure consistency
-                self.microphone = Microphone(self.dg_connection.send)
-                self.microphone.start()
-                print("Microphone started successfully.")
-            except Exception as e:
-                print(f"Failed to start microphone: {e}")
-                await self.dg_connection.finish()  # Clean up connection if microphone fails
+            if await self.dg_connection.start(options) is False:
+                print("Failed to connect to Deepgram with new settings.")
+                self.is_listening = False
                 return
-                
-        except Exception as e:
-            print(f"Failed to start Deepgram connection: {e}")
-            return
+            
+            print("Deepgram connection started successfully with asyncwebsocket.")
+            self.is_listening = True
 
-    # Remove old instance methods as they're now handled by the local async functions
-    async def send_to_manager_async(self):
-        transcript_to_send = self.accumulated_transcript.strip()
-        if transcript_to_send:
-            print(f"\nHuman: {transcript_to_send}")
-            await self.manager_queue.put(transcript_to_send)
-            self.accumulated_transcript = "" # Reset for next utterance
-        else:
-            print("Send_to_manager called with empty transcript.")
+            # Initialize and start the microphone
+            self.microphone = Microphone(self.dg_connection.send)
+            self.microphone.start()
+            print("Microphone started successfully.")
+
+        except Exception as e:
+            print(f"Error starting Deepgram connection or microphone: {e}")
+            self.is_listening = False
+            if self.dg_connection:
+                await self.dg_connection.finish() # Ensure connection is closed on error
+
+    async def send_to_manager_after_delay(self, delay):
+        await asyncio.sleep(delay)
+        # Add guard for is_listening and speech_processing_enabled
+        if not self.is_listening or not self.speech_processing_enabled:
+            self.utterance_end_timer = None # Ensure timer is cleared if we bail early
+            return
+        
+        if self.transcript_collector.get_full_transcript().strip():
+            full_transcript = self.transcript_collector.get_full_transcript().strip()
+            print(f"Human (after delay): {full_transcript}")
+            await self.manager_queue.put({'type': 'user_speech', 'data': full_transcript})
+            self.transcript_collector.reset()
+            self.speech_started = False
+        self.utterance_end_timer = None
+
 
     async def stop_listening(self):
         if self.dg_connection:
+            # Set is_listening to false early in the stop process
+            self.is_listening = False 
             try:
                 if self.microphone and hasattr(self.microphone, 'finish'):
                     try:
@@ -446,7 +497,7 @@ class DeepgramSTT:
                 print(f"Error during stop_listening: {e}")
         
         # Reset state regardless of errors
-        self.accumulated_transcript = ""
+        self.transcript_collector.reset()
         self.dg_connection = None
         self.microphone = None
 
@@ -480,7 +531,7 @@ class ConversationManager:
                 async with self.speaking_lock:
                     # Disable speech processing before speaking
                     self.is_speaking = True
-                    self.stt.processing_enabled = False
+                    self.stt.speech_processing_enabled = False
                     print("Speech processing disabled during TTS output...")
                     
                     try:
@@ -501,13 +552,11 @@ class ConversationManager:
                     finally:
                         # Even if there's an error, reset these flags
                         self.is_speaking = False
-                        self.stt.processing_enabled = True
+                        self.stt.speech_processing_enabled = True
                         print("Speech processing resumed.")
             else:
                 print("LLM returned no response.")
             
-            if not self.user_spoke_again.is_set() and self.is_running:
-                print("Audio playback complete")
         except asyncio.CancelledError:
             print("LLM/TTS processing was cancelled")
             raise
@@ -515,7 +564,7 @@ class ConversationManager:
             print(f"Error in process_llm_and_speak: {e}")
             # Still reset flags on error
             self.is_speaking = False
-            self.stt.processing_enabled = True
+            self.stt.speech_processing_enabled = True
 
     async def main_loop(self):
         await self.stt.start_listening()
@@ -523,8 +572,16 @@ class ConversationManager:
             while self.is_running:
                 try:
                     # Use a short timeout to allow for regular checks
-                    user_input = await asyncio.wait_for(self.transcription_queue.get(), timeout=0.1)
+                    queue_item = await asyncio.wait_for(self.transcription_queue.get(), timeout=0.1)
                     
+                    user_speech_data = None
+                    if isinstance(queue_item, dict) and queue_item.get('type') == 'user_speech':
+                        user_speech_data = queue_item.get('data')
+                    else:
+                        # Handle other types of queue items or log unexpected items
+                        print(f"Unexpected item in queue: {queue_item}")
+                        continue
+
                     # Only process if we're not in the middle of speaking
                     # or if the user explicitly interrupted
                     if self.is_speaking:
@@ -546,10 +603,11 @@ class ConversationManager:
                                 print(f"Error stopping TTS playback: {e}")
                     else:
                         # Normal flow - not speaking, so process the user input
-                        if user_input:
-                            if "that's enough" in user_input.lower() or \
-                            "stop listening" in user_input.lower() or \
-                            "goodbye" in user_input.lower():
+                        if user_speech_data:
+                            transcript = user_speech_data # This is the actual string now
+                            if "that's enough" in transcript.lower() or \
+                            "stop listening" in transcript.lower() or \
+                            "goodbye" in transcript.lower():
                                 print("Exit phrase detected. Shutting down.")
                                 if not self.user_spoke_again.is_set():  # Don't speak if immediately interrupted
                                     try:
@@ -561,7 +619,7 @@ class ConversationManager:
                             
                             self.user_spoke_again.clear()  # Clear before starting new task
                             try:
-                                self.current_llm_task = asyncio.create_task(self.process_llm_and_speak(user_input))
+                                self.current_llm_task = asyncio.create_task(self.process_llm_and_speak(transcript))
                             except Exception as e:
                                 print(f"Error creating LLM task: {e}")
 
