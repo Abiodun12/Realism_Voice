@@ -37,4 +37,6 @@ ENV/
 # Project specific
 *.mp3
 system_prompt.txt
-*.log 
+*.log # Ignore environment files
+.env
+.env.*
