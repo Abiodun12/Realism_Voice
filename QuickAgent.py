@@ -10,9 +10,9 @@ import argparse
 from pathlib import Path
 from openai import OpenAI
 import signal
-import websockets
 import json
 import aiohttp
+from aiohttp import web
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.memory import ConversationBufferMemory
@@ -311,7 +311,9 @@ class DeepgramSTT:
         self.processing_enabled = True  # Flag to control processing
 
     async def client_handler(self, client_websocket, path=""):
-        client_id = f"{client_websocket.remote_address[0]}:{client_websocket.remote_address[1]}"
+        # Get client IP from the WebSocketResponse object (aiohttp style)
+        peername = client_websocket._req.transport.get_extra_info('peername')
+        client_id = f"{peername[0]}:{peername[1]}" if peername else "unknown"
         print(f"New client connection from {client_id} on path {path}")
         self.accumulated_transcript_per_client[client_id] = ""
 
@@ -319,7 +321,7 @@ class DeepgramSTT:
         if not DG_API_KEY:
             print(f"Deepgram API Key not found for client {client_id}. Closing connection.")
             try:
-                await client_websocket.close(reason="Deepgram API Key not configured on server.")
+                await client_websocket.close(code=4000, message="Deepgram API Key not configured on server.")
             except Exception as e:
                 print(f"Error closing client connection: {e}")
             return
@@ -351,7 +353,15 @@ class DeepgramSTT:
                     try:
                         while True:
                             try:
-                                audio_chunk = await client_websocket.recv()
+                                msg = await client_websocket.receive()
+                                if msg.type == aiohttp.WSMsgType.BINARY:
+                                    audio_chunk = msg.data
+                                elif msg.type == aiohttp.WSMsgType.CLOSE:
+                                    print(f"Client {client_id} requested close")
+                                    break
+                                else:
+                                    print(f"Received non-binary message: {msg.type}, skipping")
+                                    continue
                                 
                                 # Check if the manager is speaking before processing/forwarding
                                 if self.manager and self.manager.is_speaking:
@@ -478,7 +488,7 @@ class DeepgramSTT:
                         print(f"Transcript receiving task for {client_id} finished.")
                         # Ensure client connection is closed if Deepgram connection ends
                         try:
-                            await client_websocket.close(reason="Deepgram connection ended")
+                            await client_websocket.close(code=1000, message="Deepgram connection ended")
                         except Exception as e:
                             print(f"Error closing client_websocket: {e}")
                 
@@ -531,40 +541,90 @@ class DeepgramSTT:
             # Optionally, prevent server from starting or run in a degraded mode
             # For now, we let it start but client_handler will fail connections.
 
-        # Create a wrapper function that handles the websockets library's parameter passing
-        async def handler_wrapper(websocket):
-            await self.client_handler(websocket)
-
-        print(f"Starting WebSocket server on {self.host}:{self.port}...")
+        # Create an aiohttp application
+        app = web.Application()
+        
+        # CORS middleware for allowing cross-origin requests
+        @web.middleware
+        async def cors_middleware(request, handler):
+            response = await handler(request)
+            # Add CORS headers to all responses
+            response.headers["Access-Control-Allow-Origin"] = "*"  # For development, in production restrict to your frontend domain
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            # Handle preflight OPTIONS requests
+            if request.method == "OPTIONS":
+                return web.Response(status=200, headers=response.headers)
+            return response
+            
+        # Add the middleware to the application
+        app.middlewares.append(cors_middleware)
+        
+        # Add routes
+        # Health check endpoint for Render
+        async def health_handler(request):
+            return web.json_response({"status": "ok", "message": "Server is running"})
+        
+        # WebSocket endpoint
+        async def websocket_handler(request):
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await self.client_handler(ws, request.path)
+            return ws
+        
+        # Add the routes to the application
+        app.router.add_get('/health', health_handler)  # Health check endpoint
+        app.router.add_get('/ws', websocket_handler)   # WebSocket endpoint
+        app.router.add_get('/', websocket_handler)     # Root path for backward compatibility
+        
+        # Start the server
+        print(f"Starting aiohttp server on {self.host}:{self.port}...")
         try:
-            self.server = await websockets.serve(handler_wrapper, self.host, self.port)
-            print(f"WebSocket server listening on {self.host}:{self.port}")
-            await self.server.wait_closed() # Keep server running until it's closed
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, self.host, self.port)
+            self.server = site  # Store site for shutdown
+            self.runner = runner  # Store runner for shutdown
+            await site.start()
+            print(f"Server listening on {self.host}:{self.port}")
+            print(f"Health check endpoint available at http://{self.host}:{self.port}/health")
+            print(f"WebSocket endpoint available at ws://{self.host}:{self.port}/ws")
+            
+            # Keep server running until stop_listening is called
+            while True:
+                await asyncio.sleep(3600)  # Sleep for a long time (1 hour)
         except OSError as e:
-            print(f"Failed to start WebSocket server on {self.host}:{self.port}: {e}")
+            print(f"Failed to start server on {self.host}:{self.port}: {e}")
             print("This might be due to the port already being in use or insufficient permissions.")
+        except asyncio.CancelledError:
+            print("Server task cancelled.")
+            raise
         except Exception as e:
-            print(f"An unexpected error occurred while starting or running the WebSocket server: {e}")
+            print(f"An unexpected error occurred while starting or running the server: {e}")
         finally:
-            print("WebSocket server has shut down.")
+            print("Server has shut down.")
 
     async def stop_listening(self):
         if self.server:
-            print("Attempting to stop WebSocket server...")
-            self.server.close()
+            print("Attempting to stop aiohttp server...")
             try:
-                # Give it a moment to close gracefully
-                await asyncio.wait_for(self.server.wait_closed(), timeout=5.0)
-                print("WebSocket server stopped.")
-            except asyncio.TimeoutError:
-                print("WebSocket server did not stop gracefully within timeout.")
+                # Stop the site first
+                await self.server.stop()
+                print("TCP site stopped.")
+                
+                # Then cleanup the runner
+                if hasattr(self, 'runner'):
+                    await self.runner.cleanup()
+                    print("App runner cleaned up.")
+                    
+                print("Server stopped successfully.")
             except Exception as e:
-                print(f"Error stopping WebSocket server: {e}")
+                print(f"Error stopping server: {e}")
         self.server = None
-        # No specific client connections to close here, client_handler should manage its own resources.
-        # Clearing accumulated transcripts on stop might be good if server restarts are expected
+        # Clearing accumulated transcripts on stop
         self.accumulated_transcript_per_client.clear()
-        print("Deepgram STT (WebSocket mode) stopped.")
+        print("Deepgram STT stopped.")
 
 class ConversationManager:
     def __init__(self, llm, tts, ws_host="localhost", ws_port=8765):
@@ -885,7 +945,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Real-time Voice Assistant")
     parser.add_argument("--text_only", action="store_true", help="Run in text-only mode (no TTS).")
     parser.add_argument("--ws_host", type=str, default="0.0.0.0", help="WebSocket server host (default: 0.0.0.0, accessible on LAN)")
-    parser.add_argument("--ws_port", type=int, default=8765, help="WebSocket server port (default: 8765)")
+    
+    # Use PORT environment variable from Render.com if available, otherwise default to 8765
+    default_port = int(os.getenv("PORT", "8765"))
+    parser.add_argument("--ws_port", type=int, default=default_port, 
+                      help=f"WebSocket server port (default: {default_port}, uses PORT env var if available)")
     args = parser.parse_args() 
 
     try:

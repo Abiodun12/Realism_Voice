@@ -5,13 +5,16 @@ services:
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python QuickAgent.py"
+    startCommand: "python QuickAgent.py --text_only"
     envVars:
       - key: DASHSCOPE_API_KEY
         sync: false
       - key: DEEPGRAM_API_KEY
         sync: false
+      - key: RIME_API_KEY  # Optional: Add if using Rime TTS (remove --text_only above if using)
+        sync: false
     healthCheckPath: "/health"
     autoDeploy: true
     region: oregon
     pythonVersion: 3.11
+    # The PORT variable is automatically set by Render and used by our application
