@@ -1,0 +1,17 @@
+# Render deployment configuration for Realism Voice Assistant backend
+services:
+  - type: web
+    name: realism-voice-backend
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python QuickAgent.py"
+    envVars:
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+    healthCheckPath: "/health"
+    autoDeploy: true
+    region: oregon
+    pythonVersion: 3.11
