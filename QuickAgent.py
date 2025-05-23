@@ -855,10 +855,9 @@ async def main_async(text_only=False):
             print("Falling back to text-only mode.")
             tts = TextToSpeech()
 
-    manager = ConversationManager(llm, tts)
+    manager = ConversationManager(llm, tts, ws_host=args.ws_host, ws_port=args.ws_port)
     
-    # Add a message to indicate the system is ready
-    print("\n🎧 System ready! Rime will speak after you click record and say something.\n")
+    print(f"\n🎧 System ready! Rime will speak after you click record and say something. WebSocket server listening on {args.ws_host}:{args.ws_port}\n")
     
     # Set up proper signal handling for cleaner shutdown
     loop = asyncio.get_running_loop()
@@ -885,8 +884,8 @@ async def shutdown(manager):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Real-time Voice Assistant")
     parser.add_argument("--text_only", action="store_true", help="Run in text-only mode (no TTS).")
-    # first_message parameter removed since we no longer use it
-    # early_processing arg is removed as the new structure inherently aims for responsiveness
+    parser.add_argument("--ws_host", type=str, default="0.0.0.0", help="WebSocket server host (default: 0.0.0.0, accessible on LAN)")
+    parser.add_argument("--ws_port", type=int, default=8765, help="WebSocket server port (default: 8765)")
     args = parser.parse_args() 
 
     try:
