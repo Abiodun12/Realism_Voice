@@ -2,7 +2,8 @@
 
 import { useState, useRef, useEffect } from 'react';
 
-const PYTHON_WEBSOCKET_URL = 'ws://localhost:8765';
+// Use secure WebSocket (wss://) for the deployed backend on Render
+const PYTHON_WEBSOCKET_URL = process.env.NEXT_PUBLIC_WEBSOCKET_URL || 'wss://realism-voice.onrender.com/ws';
 const TARGET_SAMPLE_RATE = 16000;
 
 export default function HomePage() {
@@ -19,6 +20,9 @@ export default function HomePage() {
   const audioStreamRef = useRef<MediaStream | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const audioLevelTimerRef = useRef<number | null>(null);
+  const audioBufferSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const audioChunksRef = useRef<Uint8Array[]>([]);
+  const isPlayingAudioRef = useRef<boolean>(false);
 
   useEffect(() => {
     return () => {
@@ -31,6 +35,52 @@ export default function HomePage() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Function to play audio chunks received from WebSocket
+
+  // Function to play audio chunks received from WebSocket
+  const playStreamedAudio = async (audioChunks: Uint8Array[]) => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    
+    // Concatenate all audio chunks into a single array
+    const totalLength = audioChunks.reduce((acc, chunk) => acc + chunk.length, 0);
+    const concatenatedChunks = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of audioChunks) {
+      concatenatedChunks.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    try {
+      // Decode the MP3 data
+      const audioBuffer = await audioContextRef.current.decodeAudioData(concatenatedChunks.buffer);
+      
+      // Create a source node
+      const source = audioContextRef.current.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContextRef.current.destination);
+      
+      // Store reference to stop if needed
+      audioBufferSourceRef.current = source;
+      
+      // Play the audio
+      source.start(0);
+      isPlayingAudioRef.current = true;
+      
+      // Clean up when done
+      source.onended = () => {
+        isPlayingAudioRef.current = false;
+        audioBufferSourceRef.current = null;
+        setStatus('Audio playback complete');
+      };
+    } catch (error) {
+      console.error('Error decoding or playing audio:', error);
+      setError(`Error playing audio: ${error}`);
+      isPlayingAudioRef.current = false;
+    }
+  };
 
   const connectWebSocket = () => {
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
@@ -46,16 +96,51 @@ export default function HomePage() {
       setStatus('Connected to WebSocket. Ready to record.');
       console.log('WebSocket connected');
     };
+    
     socketRef.current.onmessage = (event) => {
-      console.log('Message from server:', event.data);
-      setStatus(`Message from server: ${event.data}`);
+      // Handle text messages (JSON)
+      if (typeof event.data === 'string') {
+        try {
+          const jsonData = JSON.parse(event.data);
+          console.log('JSON message from server:', jsonData);
+          
+          // Handle different message types
+          if (jsonData.type === 'tts_audio_start') {
+            setStatus(`Receiving audio stream for: ${jsonData.text}`);
+            // Clear previous audio chunks when starting new audio
+            audioChunksRef.current = [];
+          } else if (jsonData.type === 'tts_audio_end') {
+            setStatus('Audio stream complete, playing...');
+            // Play the received audio chunks
+            if (audioChunksRef.current.length > 0) {
+              playStreamedAudio(audioChunksRef.current);
+            }
+          } else {
+            setStatus(`Message from server: ${event.data}`);
+          }
+        } catch (e) {
+          console.log('Received text message:', event.data);
+          setStatus(`Message from server: ${event.data}`);
+        }
+      } 
+      // Handle binary messages (audio data)
+      else if (event.data instanceof Blob) {
+        // Convert Blob to ArrayBuffer
+        event.data.arrayBuffer().then((buffer) => {
+          // Convert to Uint8Array and store the chunk
+          const audioChunk = new Uint8Array(buffer);
+          audioChunksRef.current.push(audioChunk);
+        });
+      }
     };
+    
     socketRef.current.onerror = (event) => {
       console.error('WebSocket error:', event);
       setError(`WebSocket error. Check console. Is Python server at ${PYTHON_WEBSOCKET_URL} running?`);
       setStatus('WebSocket error.');
       setIsConnected(false);
     };
+    
     socketRef.current.onclose = (event) => {
       setIsConnected(false);
       setIsRecording(false); 

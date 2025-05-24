@@ -309,6 +309,7 @@ class DeepgramSTT:
         self.server = None  # To store the server object for graceful shutdown
         self.accumulated_transcript_per_client = {} # To store transcript per client
         self.processing_enabled = True  # Flag to control processing
+        self.active_websockets = {}  # Track active WebSocket connections by client_id
 
     async def client_handler(self, client_websocket, path=""):
         # Get client IP from the WebSocketResponse object (aiohttp style)
@@ -316,6 +317,9 @@ class DeepgramSTT:
         client_id = f"{peername[0]}:{peername[1]}" if peername else "unknown"
         print(f"New client connection from {client_id} on path {path}")
         self.accumulated_transcript_per_client[client_id] = ""
+        
+        # Store active WebSocket for TTS streaming
+        self.active_websockets[client_id] = client_websocket
 
         DG_API_KEY = os.getenv("DEEPGRAM_API_KEY")
         if not DG_API_KEY:
@@ -524,8 +528,11 @@ class DeepgramSTT:
             print(f"Overall error in client_handler for {client_id}: {e}")
         finally:
             print(f"Client {client_id} handler finished.")
+            # Clean up client resources
             if client_id in self.accumulated_transcript_per_client:
                 del self.accumulated_transcript_per_client[client_id]
+            if client_id in self.active_websockets:
+                del self.active_websockets[client_id]
             try:
                 await client_websocket.close()
             except Exception as e:
@@ -694,10 +701,8 @@ class ConversationManager:
             self.stt.processing_enabled = True
 
     async def main_loop(self):
-        # Instead of self.stt.start_listening() directly here, 
-        # we will create a task for it to run the server concurrently.
-        stt_server_task = asyncio.create_task(self.stt.start_listening())
-        print("ConversationManager: STT server task created")
+        # Server is now started in main_async function, so we don't start it here anymore
+        print("ConversationManager: Main loop starting")
 
         try:
             print("ConversationManager: Entering main loop")
@@ -901,21 +906,33 @@ class DeepgramTTS:
 async def main_async(text_only=False):
     # Initialize your LLM and TTS with real implementations
     llm = LanguageModelProcessor()
+    manager = None
+    stt_server_task = None
     
-    if text_only:
-        tts = TextToSpeech()
-    else:
+    # Create ConversationManager first with a temporary TTS
+    temp_tts = TextToSpeech() if text_only else TextToSpeech()
+    manager = ConversationManager(llm, temp_tts, ws_host=args.ws_host, ws_port=args.ws_port)
+    
+    # Start the STT server to accept WebSocket connections - only do this once!
+    stt_server_task = asyncio.create_task(manager.stt.start_listening())
+    # Wait a moment for server to initialize
+    await asyncio.sleep(1)  
+    
+    # If not in text_only mode, set up Rime TTS
+    if not text_only:
         print("Initializing Rime TTS...")
-        from realism_voice.io.rime_tts_async import RimeTTS
         try:
-            tts = RimeTTS()
-            print("Successfully initialized Rime TTS")
+            # Use StreamingRimeTTS that can send audio to WebSocket clients
+            from realism_voice.io.rime_tts_streaming import StreamingRimeTTS
+            # Pass active WebSockets dictionary to the TTS class
+            tts = StreamingRimeTTS(websocket_clients=manager.stt.active_websockets)
+            print("Successfully initialized Streaming Rime TTS")
+            # Update manager's TTS
+            manager.tts = tts
         except Exception as e:
-            print(f"Failed to initialize Rime TTS: {e}")
+            print(f"Failed to initialize Streaming Rime TTS: {e}")
             print("Falling back to text-only mode.")
-            tts = TextToSpeech()
-
-    manager = ConversationManager(llm, tts, ws_host=args.ws_host, ws_port=args.ws_port)
+            # Keep using the temporary TextToSpeech instance
     
     print(f"\n🎧 System ready! Rime will speak after you click record and say something. WebSocket server listening on {args.ws_host}:{args.ws_port}\n")
     
